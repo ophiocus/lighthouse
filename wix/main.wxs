@@ -1,0 +1,132 @@
+<?xml version='1.0' encoding='windows-1252'?>
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <!--
+      Tokens rewritten by scripts/new_app.ps1:
+        Lighthouse       : display name (e.g. "My App")
+        lighthouse       : lowercase folder name (e.g. "myapp")
+        lighthouse        : executable name without .exe (matches Cargo `[[bin]]`)
+        ophiocus
+        Fleet health telemetry for the Tecnocratica VPS
+        https://github.com/ophiocus/lighthouse
+        AA3FEE2D-2906-4100-9DC0-362CDB69ADC0   : fresh UUID per app
+        6908FF9E-B0F3-4D7D-92FD-367D6F1BD9E7
+        4AC72183-5687-4D3D-97FD-7CD21A5C3FF6
+    -->
+    <Product
+        Id='*'
+        Name='Lighthouse'
+        UpgradeCode='AA3FEE2D-2906-4100-9DC0-362CDB69ADC0'
+        Manufacturer='ophiocus'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='Fleet health telemetry for the Tecnocratica VPS'
+            Manufacturer='ophiocus'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            AllowSameVersionUpgrades='yes'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='lighthouse Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='lighthouse'>
+
+                    <Directory Id='Bin' Name='bin'>
+                        <Component Id='Path' Guid='6908FF9E-B0F3-4D7D-92FD-367D6F1BD9E7' KeyPath='yes'>
+                            <Environment
+                                Id='PATH'
+                                Name='PATH'
+                                Value='[Bin]'
+                                Permanent='no'
+                                Part='last'
+                                Action='set'
+                                System='yes'/>
+                        </Component>
+                        <Component Id='binary0' Guid='*'>
+                            <File
+                                Id='exe0'
+                                Name='lighthouse.exe'
+                                DiskId='1'
+                                Source='$(var.CargoTargetBinDir)\lighthouse.exe'
+                                KeyPath='yes'/>
+                        </Component>
+                    </Directory>
+
+                    <Component Id='DesktopShortcut' Guid='4AC72183-5687-4D3D-97FD-7CD21A5C3FF6'>
+                        <Shortcut Id='DesktopShortcut'
+                            Name='Lighthouse'
+                            Description='Fleet health telemetry for the Tecnocratica VPS'
+                            Directory='DesktopFolder'
+                            Target='[Bin]lighthouse.exe'
+                            WorkingDirectory='Bin'
+                            Icon='ProductICO' />
+                        <RegistryValue Root='HKCU'
+                            Key='Software\ophiocus\Lighthouse'
+                            Name='DesktopShortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+                    </Component>
+                </Directory>
+            </Directory>
+            <Directory Id='DesktopFolder' Name='Desktop' />
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs the application binary.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+            <ComponentRef Id='binary0'/>
+            <ComponentRef Id='DesktopShortcut'/>
+
+            <Feature
+                Id='Environment'
+                Title='PATH Environment Variable'
+                Description='Add the install location to the PATH system environment variable.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='Path'/>
+            </Feature>
+        </Feature>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <Icon Id='ProductICO' SourceFile='assets\icon.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductICO' />
+        <Property Id='ARPHELPLINK' Value='https://github.com/ophiocus/lighthouse'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>
