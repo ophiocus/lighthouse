@@ -25,7 +25,6 @@ struct Palette {
     warn: Color32,
     crit: Color32,
     accent: Color32,
-    accent_soft: Color32,
 }
 
 impl Palette {
@@ -42,7 +41,6 @@ impl Palette {
                 warn: Color32::from_rgb(0xd8, 0xa5, 0x3a),
                 crit: Color32::from_rgb(0xf2, 0x68, 0x5c),
                 accent: Color32::from_rgb(0x3c, 0xc6, 0xdc),
-                accent_soft: Color32::from_rgb(0x14, 0x30, 0x38),
             }
         } else {
             Self {
@@ -56,7 +54,6 @@ impl Palette {
                 warn: Color32::from_rgb(0xa9, 0x72, 0x0a),
                 crit: Color32::from_rgb(0xc0, 0x36, 0x2c),
                 accent: Color32::from_rgb(0x0b, 0x7a, 0x8c),
-                accent_soft: Color32::from_rgb(0xd7, 0xed, 0xf1),
             }
         }
     }
@@ -174,8 +171,8 @@ impl eframe::App for LighthouseApp {
         egui::CentralPanel::default()
             .frame(Frame::none().fill(pal.ground).inner_margin(Margin::symmetric(24.0, 18.0)))
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.set_max_width(1120.0);
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_width(ui.available_width().min(1120.0));
                     header(ui, &pal, self);
                     if let Some(err) = &self.error {
                         banner(ui, &pal, err);
@@ -254,46 +251,38 @@ fn bottom_bar(app: &mut LighthouseApp, ctx: &egui::Context) {
 // ── header block (mirrors the artifact) ─────────────────────────────────────
 
 fn header(ui: &mut egui::Ui, pal: &Palette, app: &LighthouseApp) {
+    // Title row: big title left, status chip + live stamp right.
     ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(RichText::new(BOARD_TITLE).size(26.0).strong().color(pal.ink));
-            ui.add_space(2.0);
-            let sub = format!(
-                "{}  ·  {}  ·  {}  ·  Traefik v3",
-                app.config.host_alias, NODE_IP, NODE_OS
-            );
-            ui.label(RichText::new(sub).monospace().size(11.5).color(pal.mute));
-        });
-
-        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            ui.vertical(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if let Some(fleet) = &app.fleet {
-                        let crit = fleet.gaps.iter().filter(|g| g.sev == Sev::Crit).count();
-                        let (txt, col) = if crit > 0 {
-                            (format!("{crit} critical"), pal.crit)
-                        } else if !fleet.gaps.is_empty() {
-                            (format!("{} gap(s)", fleet.gaps.len()), pal.warn)
-                        } else {
-                            ("all clear".to_string(), pal.good)
-                        };
-                        pill(ui, &txt, col);
-                    }
-                });
-                ui.add_space(4.0);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let stamp = app
-                        .last_refresh
-                        .map(|t| format!("live · updated {}s ago", t.elapsed().as_secs()))
-                        .unwrap_or_else(|| "gathering…".into());
-                    ui.label(RichText::new(stamp).size(11.0).color(pal.mute));
-                });
-            });
+        ui.label(RichText::new(BOARD_TITLE).size(24.0).strong().color(pal.ink));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let Some(fleet) = &app.fleet {
+                let crit = fleet.gaps.iter().filter(|g| g.sev == Sev::Crit).count();
+                let (txt, col) = if crit > 0 {
+                    (format!("{crit} critical"), pal.crit)
+                } else if !fleet.gaps.is_empty() {
+                    (format!("{} gap(s)", fleet.gaps.len()), pal.warn)
+                } else {
+                    ("all clear".to_string(), pal.good)
+                };
+                pill(ui, &txt, col);
+            }
+            let stamp = app
+                .last_refresh
+                .map(|t| format!("live · updated {}s ago", t.elapsed().as_secs()))
+                .unwrap_or_else(|| "gathering…".into());
+            ui.add_space(10.0);
+            ui.label(RichText::new(stamp).size(11.0).color(pal.mute));
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(3.0);
+    let sub = format!(
+        "{}   ·   {}   ·   {}   ·   Traefik v3",
+        app.config.host_alias, NODE_IP, NODE_OS
+    );
+    ui.label(RichText::new(sub).monospace().size(11.5).color(pal.mute));
+    ui.add_space(10.0);
     hline(ui, pal.line);
-    ui.add_space(14.0);
+    ui.add_space(16.0);
 }
 
 fn loading_state(ui: &mut egui::Ui, pal: &Palette) {
@@ -428,60 +417,75 @@ fn summary(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
 }
 
 fn property_grid(ui: &mut egui::Ui, pal: &Palette, rows: &[Row], max_lat: u128) {
-    let card_w = 340.0;
+    let card_w = 336.0;
+    let gap = 14.0;
     let avail = ui.available_width();
-    let cols = (((avail + 14.0) / (card_w + 14.0)).floor() as usize).max(1);
+    let cols = (((avail + gap) / (card_w + gap)).floor() as usize)
+        .clamp(1, rows.len().max(1));
 
-    egui::Grid::new("props")
-        .num_columns(cols)
-        .spacing([14.0, 14.0])
-        .show(ui, |ui| {
-            for (i, row) in rows.iter().enumerate() {
-                property_card(ui, pal, row, card_w, max_lat);
-                if (i + 1) % cols == 0 {
-                    ui.end_row();
-                }
+    for chunk in rows.chunks(cols) {
+        // Uniform row height so cards align; taller if any card carries a note.
+        let h = if chunk.iter().any(|r| r.slug == "myevery") { 246.0 } else { 200.0 };
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for row in chunk {
+                property_card(ui, pal, row, card_w, h, max_lat);
             }
         });
+        ui.add_space(gap);
+    }
 }
 
-fn property_card(ui: &mut egui::Ui, pal: &Palette, row: &Row, w: f32, max_lat: u128) {
-    card_frame(pal).show(ui, |ui| {
-        ui.set_width(w);
+fn property_card(ui: &mut egui::Ui, pal: &Palette, row: &Row, w: f32, h: f32, max_lat: u128) {
+    let inner = w - 28.0;
+    // Hard-allocate an exact w×h region — this is what actually constrains width.
+    ui.allocate_ui_with_layout(Vec2::new(w, h), Layout::top_down(Align::Min), |ui| {
+        let rect = ui.max_rect();
+        ui.painter().rect(
+            rect,
+            Rounding::same(12.0),
+            pal.card,
+            Stroke::new(1.0, pal.line),
+        );
+        ui.set_clip_rect(rect);
+        // Inset content by 14px on all sides.
+        ui.allocate_ui_at_rect(rect.shrink(14.0), |ui| {
+            ui.set_width(inner);
 
-        // header: name + stack, pill right
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(&row.name).size(17.0).strong().color(pal.ink));
-                let stack = match row.drupal.as_ref() {
-                    Some(d) => format!("Drupal {}", d.core),
-                    None => format!("{} service", row.stack),
-                };
-                ui.label(RichText::new(stack).size(11.0).color(pal.mute));
+            // header: name + stack, pill right
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(&row.name).size(17.0).strong().color(pal.ink));
+                    let stack = match row.drupal.as_ref() {
+                        Some(d) => format!("Drupal {}", d.core),
+                        None => format!("{} service", row.stack),
+                    };
+                    ui.label(RichText::new(stack).size(11.0).color(pal.mute));
+                });
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    pill(ui, row.health.label(), pal.health(row.health));
+                });
             });
-            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                pill(ui, row.health.label(), pal.health(row.health));
-            });
-        });
 
-        ui.add_space(8.0);
+            ui.add_space(7.0);
 
-        // domain pills
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-            for d in &row.domains {
-                domain_pill(ui, pal, &ellipsize(d, 24));
-            }
-        });
+            // domains as a single wrapping mono line
+            ui.label(
+                RichText::new(row.domains.join("   ·   "))
+                    .size(11.0)
+                    .monospace()
+                    .color(pal.accent),
+            );
 
-        ui.add_space(10.0);
-        hline(ui, pal.line);
-        ui.add_space(8.0);
+            ui.add_space(9.0);
+            hline(ui, pal.line);
+            ui.add_space(9.0);
 
-        // metric grid: (HTTP, Response) (Core, Database) (TLS expires, Container up)
-        egui::Grid::new(("m", &row.slug))
+            // metric grid: (HTTP, Response) (Core, Database) (TLS expires, Container up)
+            egui::Grid::new(("m", &row.slug))
             .num_columns(2)
-            .min_col_width((w - 28.0) / 2.0)
+            .min_col_width((inner - 16.0) / 2.0)
+            .max_col_width((inner - 16.0) / 2.0)
             .spacing([16.0, 10.0])
             .show(ui, |ui| {
                 // HTTP
@@ -577,8 +581,9 @@ fn property_card(ui: &mut egui::Ui, pal: &Palette, row: &Row, w: f32, max_lat: u
                         .color(pal.mute),
                     );
                 });
-        }
-    });
+            }
+        }); // close allocate_ui_at_rect (inset content)
+    }); // close allocate_ui_with_layout (fixed w×h card)
 }
 
 fn host_panel(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
@@ -688,16 +693,6 @@ fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
-fn domain_pill(ui: &mut egui::Ui, pal: &Palette, text: &str) {
-    Frame::none()
-        .fill(pal.accent_soft)
-        .rounding(Rounding::same(6.0))
-        .inner_margin(Margin::symmetric(7.0, 2.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text).size(11.0).monospace().color(pal.accent));
-        });
-}
-
 fn banner(ui: &mut egui::Ui, pal: &Palette, msg: &str) {
     ui.add_space(4.0);
     Frame::none()
@@ -725,16 +720,6 @@ fn card_frame(pal: &Palette) -> Frame {
         .stroke(Stroke::new(1.0, pal.line))
         .rounding(Rounding::same(12.0))
         .inner_margin(Margin::same(14.0))
-}
-
-fn ellipsize(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
-        t.push('…');
-        t
-    }
 }
 
 /// "55G/315G" → "55 / 315 GB"
