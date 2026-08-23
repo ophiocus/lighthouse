@@ -1,25 +1,19 @@
-//! The collector: probe each property over HTTPS from here, gather host/docker
-//! state over SSH, and merge the two into a render-ready [`Fleet`].
+//! The collector: discover projects + gather host/docker telemetry over SSH,
+//! probe each project over HTTPS from here, and merge into a [`Fleet`].
 //!
-//! Blocking by design — call it on a background thread (see `app.rs`) and hand
-//! the result back over a channel so the UI never stalls.
+//! Blocking by design — call it on a background thread (see `app.rs`).
 
 use crate::dates;
 use crate::model::*;
-use crate::registry::PropertyDef;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The gather script, embedded so the binary is self-contained.
 const GATHER_SH: &str = include_str!("../scripts/gather.sh");
-
-/// TLS warning threshold — a cert expiring within this many days is a gap.
 const TLS_WARN_DAYS: i64 = 21;
 
-/// Collect the whole fleet. `host_alias` is an entry in the operator's
-/// `~/.ssh/config` (e.g. `tecnocratica_node_1`).
-pub fn collect(host_alias: &str, registry: &[PropertyDef]) -> Result<Fleet, String> {
+/// Discover and collect the whole fleet from `host_alias` (an ~/.ssh/config entry).
+pub fn collect(host_alias: &str) -> Result<Fleet, String> {
     let gather = ssh_gather(host_alias)?;
 
     let client = reqwest::blocking::Client::builder()
@@ -30,75 +24,45 @@ pub fn collect(host_alias: &str, registry: &[PropertyDef]) -> Result<Fleet, Stri
         .map_err(|e| format!("http client: {e}"))?;
 
     let mut rows = Vec::new();
-    let mut props_up = 0;
-    for def in registry {
-        let http = http_probe(&client, &def.url, &def.probe_path);
-        let container = gather
-            .containers
-            .iter()
-            .find(|c| c.name == def.container)
-            .cloned();
-        let drupal = gather
-            .drupal
-            .iter()
-            .find(|d| d.name == def.container)
-            .cloned();
-        let tls_not_after = gather
-            .tls
-            .iter()
-            .find(|t| t.domain == def.tls_domain)
-            .map(|t| t.not_after.clone())
-            .filter(|s| !s.is_empty());
+    let (mut healthy, mut drupal_count, mut node_count) = (0, 0, 0);
 
-        let health = derive_health(&http, &container, &drupal);
-        if health == Health::Up {
-            props_up += 1;
+    for p in &gather.projects {
+        let ptype = ProjectType::parse(&p.kind);
+        match ptype {
+            ProjectType::Drupal => drupal_count += 1,
+            ProjectType::Node => node_count += 1,
+            ProjectType::Unknown => {}
         }
-
-        rows.push(Row {
-            slug: def.slug.clone(),
-            name: def.name.clone(),
-            stack: def.stack.clone(),
-            url: def.url.clone(),
-            probe_path: def.probe_path.clone(),
-            domains: def.domains.clone(),
-            http,
-            container,
-            drupal,
-            tls_not_after,
-            health,
-        });
+        let http = if p.url.is_empty() {
+            None
+        } else {
+            http_probe(&client, &p.url, &p.probe_path)
+        };
+        let health = derive_health(&http, p);
+        if health == Health::Up {
+            healthy += 1;
+        }
+        rows.push(Row { p: p.clone(), ptype, http, health });
     }
 
-    let running = gather
-        .containers
-        .iter()
-        .filter(|c| c.status == "running")
-        .count();
     let gaps = derive_gaps(&gather, &rows);
-
     Ok(Fleet {
         generated: gather.generated.clone(),
-        props_up,
-        props_total: rows.len(),
-        containers_running: running,
-        containers_total: gather.containers.len(),
+        total: rows.len(),
+        healthy,
+        drupal_count,
+        node_count,
         host: Some(gather.host),
         gaps,
         rows,
     })
 }
 
-/// Pipe the embedded gather script to `ssh <alias> bash -s` and parse its JSON.
 fn ssh_gather(host_alias: &str) -> Result<Gather, String> {
-    // Windows-side source is CRLF; bash chokes on the stray \r, so strip it.
     let script = GATHER_SH.replace('\r', "");
-
     let mut child = Command::new("ssh")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=15")
+        .arg("-o").arg("BatchMode=yes")
+        .arg("-o").arg("ConnectTimeout=15")
         .arg(host_alias)
         .arg("bash -s")
         .stdin(Stdio::piped())
@@ -114,69 +78,44 @@ fn ssh_gather(host_alias: &str) -> Result<Gather, String> {
         .write_all(script.as_bytes())
         .map_err(|e| format!("write script: {e}"))?;
 
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("ssh wait: {e}"))?;
-
+    let out = child.wait_with_output().map_err(|e| format!("ssh wait: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "ssh to '{host_alias}' failed ({}): {}",
-            out.status,
-            err.trim()
-        ));
+        return Err(format!("ssh to '{host_alias}' failed ({}): {}", out.status, err.trim()));
     }
-
     let stdout = String::from_utf8_lossy(&out.stdout);
-    serde_json::from_str::<Gather>(&stdout)
-        .map_err(|e| format!("parse gather json: {e}"))
+    serde_json::from_str::<Gather>(&stdout).map_err(|e| format!("parse gather json: {e}"))
 }
 
-/// GET the probe URL, timing the round trip. `ok` is true on a 200.
 fn http_probe(client: &reqwest::blocking::Client, base: &str, path: &str) -> Option<HttpProbe> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let start = Instant::now();
     match client.get(&url).send() {
         Ok(resp) => {
             let code = resp.status().as_u16();
-            Some(HttpProbe {
-                code,
-                latency_ms: start.elapsed().as_millis(),
-                ok: code == 200,
-            })
+            Some(HttpProbe { code, latency_ms: start.elapsed().as_millis(), ok: code == 200 })
         }
         Err(_) => None,
     }
 }
 
-fn derive_health(
-    http: &Option<HttpProbe>,
-    container: &Option<Container>,
-    drupal: &Option<DrupalNode>,
-) -> Health {
-    // No probe result at all → we can't say.
+fn derive_health(http: &Option<HttpProbe>, p: &Project) -> Health {
     let Some(h) = http else {
-        return if container.is_some() {
-            Health::Warn // running but unreachable over HTTPS
-        } else {
-            Health::Unknown
-        };
+        return if p.status == "running" { Health::Warn } else { Health::Down };
     };
-
     if !h.ok {
         return Health::Down;
     }
-    if let Some(c) = container {
-        if c.status != "running" {
-            return Health::Down;
+    if p.status != "running" {
+        return Health::Down;
+    }
+    if let Some(m) = &p.maintenance {
+        if m != "0" && !m.is_empty() {
+            return Health::Warn;
         }
     }
-    if let Some(d) = drupal {
-        let maint = d.maintenance.as_str();
-        if maint != "0" && !maint.is_empty() {
-            return Health::Warn; // maintenance mode on
-        }
-        if d.db != "Connected" {
+    if let Some(db) = &p.db_status {
+        if db != "Connected" {
             return Health::Warn;
         }
     }
@@ -190,10 +129,10 @@ fn derive_gaps(g: &Gather, rows: &[Row]) -> Vec<Gap> {
         if r.health == Health::Down {
             gaps.push(Gap {
                 sev: Sev::Crit,
-                label: r.slug.clone(),
+                label: r.p.slug.clone(),
                 text: match &r.http {
-                    Some(h) => format!("{} → HTTP {} at {}", r.url, h.code, r.probe_path),
-                    None => format!("{} unreachable over HTTPS", r.url),
+                    Some(h) => format!("{} → HTTP {} at {}", r.p.url, h.code, r.p.probe_path),
+                    None => format!("{} unreachable over HTTPS", r.p.url),
                 },
             });
         }
@@ -217,31 +156,24 @@ fn derive_gaps(g: &Gather, rows: &[Row]) -> Vec<Gap> {
         });
     }
 
-    // Drupal images without a Docker HEALTHCHECK — telemetry falls back to HTTP.
-    let no_hc: Vec<&str> = g
-        .containers
+    let no_hc = rows
         .iter()
-        .filter(|c| c.name.ends_with("-drupal-1") && c.health == "none")
-        .map(|c| c.name.as_str())
-        .collect();
-    if !no_hc.is_empty() {
+        .filter(|r| r.ptype == ProjectType::Drupal && r.p.health == "none")
+        .count();
+    if no_hc > 0 {
         gaps.push(Gap {
             sev: Sev::Warn,
             label: "images".into(),
-            text: format!(
-                "{} Drupal container(s) ship no Docker HEALTHCHECK",
-                no_hc.len()
-            ),
+            text: format!("{no_hc} Drupal container(s) ship no Docker HEALTHCHECK"),
         });
     }
 
-    // Nearest TLS expiry within the warning window.
     let mut nearest: Option<(i64, String)> = None;
     for r in rows {
-        if let Some(na) = &r.tls_not_after {
-            if let Some(days) = dates::days_until(na) {
+        if !r.p.tls.is_empty() {
+            if let Some(days) = dates::days_until(&r.p.tls) {
                 if nearest.as_ref().map_or(true, |(d, _)| days < *d) {
-                    nearest = Some((days, r.name.clone()));
+                    nearest = Some((days, r.p.slug.clone()));
                 }
             }
         }

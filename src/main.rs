@@ -2,13 +2,14 @@
 // `--probe`, panics, and logging are visible under `cargo run`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod app;
 mod config;
 mod dates;
 mod git_update;
 mod model;
-mod registry;
 mod telemetry;
+mod template;
 
 use eframe::egui;
 
@@ -44,25 +45,25 @@ fn main() -> eframe::Result<()> {
 fn run_probe() {
     let cfg = config::Config::load();
     println!("lighthouse probe → {}", cfg.host_alias);
-    match telemetry::collect(&cfg.host_alias, &registry::default_registry()) {
+    match telemetry::collect(&cfg.host_alias) {
         Ok(f) => {
             println!(
-                "props {}/{}  containers {}/{}  gaps {}  (snapshot {})",
-                f.props_up, f.props_total, f.containers_running, f.containers_total,
-                f.gaps.len(), f.generated
+                "{} projects ({} Drupal, {} Node)  healthy {}/{}  gaps {}  (snapshot {})",
+                f.total, f.drupal_count, f.node_count, f.healthy, f.total, f.gaps.len(), f.generated
             );
             for r in &f.rows {
                 let code = r.http.as_ref().map(|h| h.code.to_string()).unwrap_or_else(|| "---".into());
                 let lat = r.http.as_ref().map(|h| format!("{}ms", h.latency_ms)).unwrap_or_else(|| "-".into());
                 println!(
-                    "  {:16} {:8} http={:>3} {:>7}  core={:8} db={:10} tls={}",
-                    r.name,
+                    "  {:16} {:7} {:8} http={:>3} {:>7}  core={:8} db={:10} tls={}",
+                    r.p.slug,
+                    r.ptype.label(),
                     r.health.label(),
                     code,
                     lat,
-                    r.drupal.as_ref().map(|d| d.core.as_str()).unwrap_or("-"),
-                    r.drupal.as_ref().map(|d| d.db.as_str()).unwrap_or("-"),
-                    r.tls_not_after.as_deref().unwrap_or("-"),
+                    r.p.core.as_deref().unwrap_or("-"),
+                    r.p.db_status.as_deref().unwrap_or("-"),
+                    if r.p.tls.is_empty() { "-" } else { &r.p.tls },
                 );
             }
             if let Some(h) = &f.host {

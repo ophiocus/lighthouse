@@ -1,19 +1,25 @@
+use crate::actions::{self, ActionResult};
 use crate::config::Config;
 use crate::git_update::{UpdateAvailable, UpdateState};
-use crate::model::{Fleet, Gap, Health, Row, Sev};
-use crate::registry::{default_registry, PropertyDef};
+use crate::model::{Fleet, Gap, Health, Project, ProjectType, Row, Sev};
+use crate::template::{actions_for, Action};
 use crate::{dates, telemetry};
 use eframe::egui;
 use egui::{Align, Color32, Frame, Layout, Margin, Rect, RichText, Rounding, Stroke, Vec2};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-// Stable identity of the node, mirrored from the published board's subline.
 const NODE_IP: &str = "104.225.221.7";
 const NODE_OS: &str = "Ubuntu 24.04";
-const BOARD_TITLE: &str = "Tecnocrática Fleet Health";
+const BOARD_TITLE: &str = "Tecnocrática Fleet Control";
 
-/// Theme-derived colors — exact hexes from the published artifact.
+/// A pending, not-yet-confirmed action against a project.
+#[derive(Clone)]
+struct Pending {
+    action: Action,
+    project: Project,
+}
+
 struct Palette {
     ground: Color32,
     card: Color32,
@@ -25,6 +31,7 @@ struct Palette {
     warn: Color32,
     crit: Color32,
     accent: Color32,
+    node: Color32,
 }
 
 impl Palette {
@@ -41,6 +48,7 @@ impl Palette {
                 warn: Color32::from_rgb(0xd8, 0xa5, 0x3a),
                 crit: Color32::from_rgb(0xf2, 0x68, 0x5c),
                 accent: Color32::from_rgb(0x3c, 0xc6, 0xdc),
+                node: Color32::from_rgb(0x8c, 0xb4, 0x6a),
             }
         } else {
             Self {
@@ -54,10 +62,10 @@ impl Palette {
                 warn: Color32::from_rgb(0xa9, 0x72, 0x0a),
                 crit: Color32::from_rgb(0xc0, 0x36, 0x2c),
                 accent: Color32::from_rgb(0x0b, 0x7a, 0x8c),
+                node: Color32::from_rgb(0x5a, 0x7d, 0x3a),
             }
         }
     }
-
     fn health(&self, h: Health) -> Color32 {
         match h {
             Health::Up => self.good,
@@ -66,17 +74,30 @@ impl Palette {
             Health::Unknown => self.mute,
         }
     }
+    fn type_color(&self, t: ProjectType) -> Color32 {
+        match t {
+            ProjectType::Drupal => self.accent,
+            ProjectType::Node => self.node,
+            ProjectType::Unknown => self.mute,
+        }
+    }
 }
 
 pub struct LighthouseApp {
     pub config: Config,
-    registry: Vec<PropertyDef>,
 
     fleet: Option<Fleet>,
     error: Option<String>,
     loading: bool,
     last_refresh: Option<Instant>,
     fleet_rx: Option<mpsc::Receiver<Result<Fleet, String>>>,
+
+    // control-action plumbing
+    pending: Option<Pending>,
+    action_rx: Option<mpsc::Receiver<ActionResult>>,
+    action_busy: bool,
+    action_title: String,
+    action_log: Option<ActionResult>,
 
     update_state: UpdateState,
     update_error: Option<String>,
@@ -96,12 +117,16 @@ impl LighthouseApp {
 
         let mut app = Self {
             config,
-            registry: default_registry(),
             fleet: None,
             error: None,
             loading: false,
             last_refresh: None,
             fleet_rx: None,
+            pending: None,
+            action_rx: None,
+            action_busy: false,
+            action_title: String::new(),
+            action_log: None,
             update_state: UpdateState::Checking,
             update_error: None,
             update_rx: Some(rx),
@@ -119,9 +144,21 @@ impl LighthouseApp {
         let (tx, rx) = mpsc::channel();
         self.fleet_rx = Some(rx);
         let host = self.config.host_alias.clone();
-        let reg = self.registry.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(telemetry::collect(&host, &reg));
+            let _ = tx.send(telemetry::collect(&host));
+        });
+    }
+
+    fn start_action(&mut self, pending: Pending) {
+        self.action_busy = true;
+        self.action_log = None;
+        self.action_title = format!("{} · {}", pending.action.label(), pending.project.slug);
+        let (tx, rx) = mpsc::channel();
+        self.action_rx = Some(rx);
+        let host = self.config.host_alias.clone();
+        let cmd = pending.action.command(&pending.project);
+        std::thread::spawn(move || {
+            let _ = tx.send(actions::run(&host, &cmd));
         });
     }
 
@@ -147,6 +184,13 @@ impl LighthouseApp {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.action_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.action_log = Some(res);
+                self.action_busy = false;
+                self.action_rx = None;
+            }
+        }
     }
 }
 
@@ -168,17 +212,18 @@ impl eframe::App for LighthouseApp {
         top_bar(self, ctx, &pal);
         bottom_bar(self, ctx);
 
+        let mut intent: Option<Pending> = None;
         egui::CentralPanel::default()
             .frame(Frame::none().fill(pal.ground).inner_margin(Margin::symmetric(24.0, 18.0)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.set_width(ui.available_width().min(1120.0));
+                    ui.set_width(ui.available_width().min(1160.0));
                     header(ui, &pal, self);
                     if let Some(err) = &self.error {
                         banner(ui, &pal, err);
                     }
                     match &self.fleet {
-                        Some(fleet) => board(ui, &pal, fleet),
+                        Some(fleet) => board(ui, &pal, fleet, &mut intent),
                         None if self.loading => loading_state(ui, &pal),
                         None => {
                             ui.add_space(60.0);
@@ -189,8 +234,109 @@ impl eframe::App for LighthouseApp {
                     }
                 });
             });
+        if let Some(p) = intent {
+            self.pending = Some(p);
+        }
+
+        self.render_confirm(ctx, &pal);
+        self.render_result(ctx, &pal);
 
         ctx.request_repaint_after(Duration::from_secs(1));
+    }
+}
+
+impl LighthouseApp {
+    fn render_confirm(&mut self, ctx: &egui::Context, pal: &Palette) {
+        let Some(pending) = self.pending.clone() else { return };
+        let mut decision = 0u8; // 1 = cancel, 2 = run
+        egui::Window::new(RichText::new("Confirm action").strong())
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(420.0);
+                ui.add_space(4.0);
+                ui.label(RichText::new(pending.action.confirm(&pending.project)).size(14.0));
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("→ {}", pending.action.command(&pending.project)))
+                        .monospace()
+                        .size(11.0)
+                        .color(pal.mute),
+                );
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        decision = 1;
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let col = if pending.action.danger() { pal.crit } else { pal.accent };
+                        let run = egui::Button::new(
+                            RichText::new(format!("Run  {}", pending.action.label()))
+                                .color(Color32::WHITE),
+                        )
+                        .fill(col);
+                        if ui.add(run).clicked() {
+                            decision = 2;
+                        }
+                    });
+                });
+            });
+        match decision {
+            1 => self.pending = None,
+            2 => {
+                self.pending = None;
+                self.start_action(pending);
+            }
+            _ => {}
+        }
+    }
+
+    fn render_result(&mut self, ctx: &egui::Context, pal: &Palette) {
+        if self.action_busy {
+            egui::Window::new("Running…")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new());
+                        ui.label(&self.action_title);
+                    });
+                });
+            return;
+        }
+        let mut close = false;
+        if let Some(res) = &self.action_log {
+            egui::Window::new(RichText::new(format!(
+                "{}  {}",
+                if res.ok { "✓" } else { "✗" },
+                self.action_title
+            )))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                let col = if res.ok { pal.good } else { pal.crit };
+                ui.label(RichText::new(if res.ok { "success" } else { "failed" }).strong().color(col));
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(&res.output).monospace().size(11.5))
+                            .wrap(),
+                    );
+                });
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        }
+        if close {
+            self.action_log = None;
+            self.start_refresh(); // reflect any state change the action made
+        }
     }
 }
 
@@ -199,11 +345,11 @@ fn apply_visuals(ctx: &egui::Context, dark: bool) {
     let pal = Palette::new(dark);
     v.override_text_color = Some(pal.ink);
     v.panel_fill = pal.ground;
-    v.window_fill = pal.ground;
+    v.window_fill = pal.card;
     ctx.set_visuals(v);
 }
 
-// ── top / bottom bars (app chrome) ──────────────────────────────────────────
+// ── top / bottom bars ───────────────────────────────────────────────────────
 
 fn top_bar(app: &mut LighthouseApp, ctx: &egui::Context, pal: &Palette) {
     egui::TopBottomPanel::top("top_bar")
@@ -212,7 +358,6 @@ fn top_bar(app: &mut LighthouseApp, ctx: &egui::Context, pal: &Palette) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Lighthouse").strong().color(pal.ink));
                 ui.label(RichText::new(&app.config.host_alias).monospace().size(11.0).color(pal.mute));
-
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.menu_button("View", |ui| {
                         if ui.checkbox(&mut app.config.dark_mode, "Dark mode").changed() {
@@ -248,10 +393,9 @@ fn bottom_bar(app: &mut LighthouseApp, ctx: &egui::Context) {
     });
 }
 
-// ── header block (mirrors the artifact) ─────────────────────────────────────
+// ── header ──────────────────────────────────────────────────────────────────
 
 fn header(ui: &mut egui::Ui, pal: &Palette, app: &LighthouseApp) {
-    // Title row: big title left, status chip + live stamp right.
     ui.horizontal(|ui| {
         ui.label(RichText::new(BOARD_TITLE).size(24.0).strong().color(pal.ink));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -290,17 +434,17 @@ fn loading_state(ui: &mut egui::Ui, pal: &Palette) {
     ui.vertical_centered(|ui| {
         ui.add(egui::Spinner::new().size(28.0));
         ui.add_space(8.0);
-        ui.label(RichText::new("gathering fleet telemetry…").color(pal.mute));
+        ui.label(RichText::new("discovering projects…").color(pal.mute));
     });
 }
 
 // ── board ───────────────────────────────────────────────────────────────────
 
-fn board(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
+fn board(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet, intent: &mut Option<Pending>) {
     summary(ui, pal, fleet);
     ui.add_space(22.0);
 
-    section(ui, pal, "PROPERTIES");
+    section(ui, pal, "PROJECTS");
     ui.add_space(10.0);
     let max_lat = fleet
         .rows
@@ -309,7 +453,7 @@ fn board(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
         .max()
         .unwrap_or(1)
         .max(1);
-    property_grid(ui, pal, &fleet.rows, max_lat);
+    property_grid(ui, pal, &fleet.rows, max_lat, intent);
 
     ui.add_space(24.0);
     section(ui, pal, "EDGE & HOST");
@@ -317,7 +461,6 @@ fn board(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
     if fleet.host.is_some() {
         host_panel(ui, pal, fleet);
     }
-
     if !fleet.gaps.is_empty() {
         ui.add_space(16.0);
         for g in &fleet.gaps {
@@ -325,47 +468,41 @@ fn board(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
             ui.add_space(10.0);
         }
     }
-
     ui.add_space(14.0);
     ui.label(
-        RichText::new(format!(
-            "live · gathered over SSH, read-only · snapshot {}",
-            fleet.generated
-        ))
-        .size(11.0)
-        .color(pal.mute),
+        RichText::new(format!("live · discovered & gathered over SSH, read-only telemetry · snapshot {}", fleet.generated))
+            .size(11.0)
+            .color(pal.mute),
     );
     ui.add_space(16.0);
 }
 
 fn summary(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
-    // nearest TLS
     let mut nearest: Option<(i64, String)> = None;
     for r in &fleet.rows {
-        if let Some(na) = &r.tls_not_after {
-            if let Some(days) = dates::days_until(na) {
+        if !r.p.tls.is_empty() {
+            if let Some(days) = dates::days_until(&r.p.tls) {
                 if nearest.as_ref().map_or(true, |(d, _)| days < *d) {
-                    let date = na.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                    let date = r.p.tls.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                     nearest = Some((days, date));
                 }
             }
         }
     }
-    let restarts: i64 = 0; // running fleet; sum kept simple
     let crit = fleet.gaps.iter().filter(|g| g.sev == Sev::Crit).count();
 
     let tiles: [(&str, String, Option<String>, Color32); 4] = [
         (
-            "PROPERTIES UP",
-            format!("{} / {}", fleet.props_up, fleet.props_total),
-            None,
-            if fleet.props_up == fleet.props_total { pal.good } else { pal.crit },
+            "PROJECTS",
+            fleet.total.to_string(),
+            Some(format!("{} Drupal · {} Node", fleet.drupal_count, fleet.node_count)),
+            pal.ink,
         ),
         (
-            "CONTAINERS",
-            format!("{} / {}", fleet.containers_running, fleet.containers_total),
-            Some(format!("{restarts} restarts")),
-            if fleet.containers_running == fleet.containers_total { pal.good } else { pal.crit },
+            "HEALTHY",
+            format!("{} / {}", fleet.healthy, fleet.total),
+            None,
+            if fleet.healthy == fleet.total { pal.good } else { pal.crit },
         ),
         (
             "NEAREST TLS EXPIRY",
@@ -416,186 +553,178 @@ fn summary(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
         });
 }
 
-fn property_grid(ui: &mut egui::Ui, pal: &Palette, rows: &[Row], max_lat: u128) {
-    let card_w = 336.0;
+fn property_grid(ui: &mut egui::Ui, pal: &Palette, rows: &[Row], max_lat: u128, intent: &mut Option<Pending>) {
+    let card_w = 360.0;
     let gap = 14.0;
     let avail = ui.available_width();
-    let cols = (((avail + gap) / (card_w + gap)).floor() as usize)
-        .clamp(1, rows.len().max(1));
+    let cols = (((avail + gap) / (card_w + gap)).floor() as usize).clamp(1, rows.len().max(1));
 
     for chunk in rows.chunks(cols) {
-        // Uniform row height so cards align; taller if any card carries a note.
-        let h = if chunk.iter().any(|r| r.slug == "myevery") { 246.0 } else { 200.0 };
+        let h = 288.0;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for row in chunk {
-                property_card(ui, pal, row, card_w, h, max_lat);
+                property_card(ui, pal, row, card_w, h, max_lat, intent);
             }
         });
         ui.add_space(gap);
     }
 }
 
-fn property_card(ui: &mut egui::Ui, pal: &Palette, row: &Row, w: f32, h: f32, max_lat: u128) {
+fn property_card(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    row: &Row,
+    w: f32,
+    h: f32,
+    max_lat: u128,
+    intent: &mut Option<Pending>,
+) {
     let inner = w - 28.0;
-    // Hard-allocate an exact w×h region — this is what actually constrains width.
     ui.allocate_ui_with_layout(Vec2::new(w, h), Layout::top_down(Align::Min), |ui| {
         let rect = ui.max_rect();
-        ui.painter().rect(
-            rect,
-            Rounding::same(12.0),
-            pal.card,
-            Stroke::new(1.0, pal.line),
-        );
+        ui.painter().rect(rect, Rounding::same(12.0), pal.card, Stroke::new(1.0, pal.line));
         ui.set_clip_rect(rect);
-        // Inset content by 14px on all sides.
         ui.allocate_ui_at_rect(rect.shrink(14.0), |ui| {
             ui.set_width(inner);
 
-            // header: name + stack, pill right
+            // header: name + type + health
             ui.horizontal(|ui| {
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(&row.name).size(17.0).strong().color(pal.ink));
-                    let stack = match row.drupal.as_ref() {
-                        Some(d) => format!("Drupal {}", d.core),
-                        None => format!("{} service", row.stack),
+                    ui.label(RichText::new(&row.p.slug).size(17.0).strong().color(pal.ink));
+                    let sub = match row.ptype {
+                        ProjectType::Drupal => format!("Drupal {}", row.p.core.as_deref().unwrap_or("")),
+                        ProjectType::Node => "Node service".to_string(),
+                        ProjectType::Unknown => "Unknown".to_string(),
                     };
-                    ui.label(RichText::new(stack).size(11.0).color(pal.mute));
+                    ui.label(RichText::new(sub).size(11.0).color(pal.type_color(row.ptype)));
                 });
                 ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
                     pill(ui, row.health.label(), pal.health(row.health));
+                    if row.p.maintenance.as_deref().map_or(false, |m| m != "0" && !m.is_empty()) {
+                        pill(ui, "maint", pal.warn);
+                    }
                 });
             });
 
             ui.add_space(7.0);
-
-            // domains as a single wrapping mono line
-            ui.label(
-                RichText::new(row.domains.join("   ·   "))
-                    .size(11.0)
-                    .monospace()
-                    .color(pal.accent),
-            );
-
+            ui.label(RichText::new(row.p.domains.join("   ·   ")).size(11.0).monospace().color(pal.type_color(row.ptype)));
             ui.add_space(9.0);
             hline(ui, pal.line);
             ui.add_space(9.0);
 
-            // metric grid: (HTTP, Response) (Core, Database) (TLS expires, Container up)
-            egui::Grid::new(("m", &row.slug))
-            .num_columns(2)
-            .min_col_width((inner - 16.0) / 2.0)
-            .max_col_width((inner - 16.0) / 2.0)
-            .spacing([16.0, 10.0])
-            .show(ui, |ui| {
-                // HTTP
-                metric(ui, pal, "HTTP", |ui| match &row.http {
-                    Some(h) => {
-                        ui.label(RichText::new(h.code.to_string()).size(13.0).monospace().color(
-                            if h.ok { pal.good } else { pal.crit },
-                        ));
-                        ui.label(RichText::new(&row.probe_path).size(12.0).monospace().color(pal.mute));
-                    }
-                    None => {
-                        ui.label(RichText::new("unreachable").size(13.0).monospace().color(pal.crit));
-                    }
-                });
-                // Response + latency bar
-                metric(ui, pal, "RESPONSE", |ui| match &row.http {
-                    Some(h) => {
-                        let secs = h.latency_ms as f32 / 1000.0;
-                        let col = if h.latency_ms < 1000 { pal.good } else { pal.ink };
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(format!("{secs:.2}s")).size(13.0).monospace().color(col));
-                            let frac = (h.latency_ms as f32 / max_lat as f32).clamp(0.05, 1.0);
-                            latency_bar(ui, pal, frac);
-                        });
-                    }
-                    None => {
-                        ui.label(RichText::new("—").size(13.0).monospace().color(pal.mute));
-                    }
-                });
-                ui.end_row();
+            metrics(ui, pal, row, inner, max_lat);
 
-                // Core
-                metric(ui, pal, "CORE", |ui| match row.drupal.as_ref() {
-                    Some(d) => {
-                        ui.label(RichText::new(&d.core).size(13.0).monospace().color(pal.ink));
+            // actions
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                for &a in actions_for(row.ptype) {
+                    let col = if a.danger() { pal.crit } else { pal.accent };
+                    let btn = egui::Button::new(RichText::new(a.label()).size(11.5).color(col))
+                        .fill(pal.surface2)
+                        .stroke(Stroke::new(1.0, pal.line));
+                    if ui.add(btn).clicked() {
+                        *intent = Some(Pending { action: a, project: row.p.clone() });
                     }
-                    None => {
-                        ui.label(RichText::new("n/a").size(13.0).monospace().color(pal.mute));
-                    }
-                });
-                // Database
-                metric(ui, pal, "DATABASE", |ui| match row.drupal.as_ref() {
-                    Some(d) => {
-                        let col = if d.db == "Connected" { pal.good } else { pal.warn };
-                        ui.label(RichText::new(&d.db).size(13.0).monospace().color(col));
-                    }
-                    None => {
-                        ui.label(RichText::new("n/a").size(13.0).monospace().color(pal.mute));
-                    }
-                });
-                ui.end_row();
-
-                // TLS expires
-                metric(ui, pal, "TLS EXPIRES", |ui| {
-                    let txt = row
-                        .tls_not_after
-                        .as_ref()
-                        .map(|na| na.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
-                        .unwrap_or_else(|| "—".into());
-                    ui.label(RichText::new(txt).size(13.0).monospace().color(pal.ink));
-                });
-                // Container up
-                metric(ui, pal, "CONTAINER UP", |ui| match row.container.as_ref() {
-                    Some(c) => {
-                        let restarts: i64 = c.restarts.parse().unwrap_or(0);
-                        ui.label(RichText::new(fmt_since(&c.started)).size(13.0).monospace().color(pal.ink));
-                        let rt = format!("· {restarts} restarts");
-                        let col = if restarts > 0 { pal.warn } else { pal.mute };
-                        ui.label(RichText::new(rt).size(11.0).monospace().color(col));
-                    }
-                    None => {
-                        ui.label(RichText::new("—").size(13.0).monospace().color(pal.mute));
-                    }
-                });
-                ui.end_row();
+                }
             });
+        });
+    });
+}
 
-        // myevery note
-        if row.slug == "myevery" {
-            ui.add_space(8.0);
-            Frame::none()
-                .fill(pal.surface2)
-                .rounding(Rounding::same(8.0))
-                .inner_margin(Margin::symmetric(10.0, 8.0))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new(
-                            "Root / returns 404 by design — API service. Liveness probe is \
-                             /healthz → 200, matching the container healthcheck on :8787.",
-                        )
-                        .size(11.0)
-                        .color(pal.mute),
-                    );
-                });
+fn metrics(ui: &mut egui::Ui, pal: &Palette, row: &Row, inner: f32, max_lat: u128) {
+    egui::Grid::new(("m", &row.p.slug))
+        .num_columns(2)
+        .min_col_width((inner - 16.0) / 2.0)
+        .max_col_width((inner - 16.0) / 2.0)
+        .spacing([16.0, 10.0])
+        .show(ui, |ui| {
+            // HTTP + RESPONSE (both types)
+            metric(ui, pal, "HTTP", |ui| match &row.http {
+                Some(hp) => {
+                    ui.label(RichText::new(hp.code.to_string()).size(13.0).monospace().color(if hp.ok { pal.good } else { pal.crit }));
+                    ui.label(RichText::new(&row.p.probe_path).size(12.0).monospace().color(pal.mute));
+                }
+                None => {
+                    ui.label(RichText::new("unreachable").size(13.0).monospace().color(pal.crit));
+                }
+            });
+            metric(ui, pal, "RESPONSE", |ui| match &row.http {
+                Some(hp) => {
+                    let secs = hp.latency_ms as f32 / 1000.0;
+                    let col = if hp.latency_ms < 1000 { pal.good } else { pal.ink };
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new(format!("{secs:.2}s")).size(13.0).monospace().color(col));
+                        latency_bar(ui, pal, (hp.latency_ms as f32 / max_lat as f32).clamp(0.05, 1.0));
+                    });
+                }
+                None => {
+                    ui.label(RichText::new("—").size(13.0).monospace().color(pal.mute));
+                }
+            });
+            ui.end_row();
+
+            // type-specific middle row
+            match row.ptype {
+                ProjectType::Node => {
+                    metric(ui, pal, "HEALTH", |ui| {
+                        let (txt, col) = match row.p.health.as_str() {
+                            "healthy" => ("healthy", pal.good),
+                            "none" => ("no check", pal.mute),
+                            other => (other, pal.warn),
+                        };
+                        ui.label(RichText::new(txt).size(13.0).monospace().color(col));
+                    });
+                }
+                _ => {
+                    metric(ui, pal, "CORE", |ui| {
+                        ui.label(RichText::new(row.p.core.as_deref().unwrap_or("n/a")).size(13.0).monospace().color(pal.ink));
+                    });
+                }
             }
-        }); // close allocate_ui_at_rect (inset content)
-    }); // close allocate_ui_with_layout (fixed w×h card)
+            match row.ptype {
+                ProjectType::Node => {
+                    metric(ui, pal, "SERVICE", |ui| {
+                        ui.label(RichText::new(&row.p.service).size(13.0).monospace().color(pal.ink));
+                    });
+                }
+                _ => {
+                    metric(ui, pal, "DATABASE", |ui| {
+                        let db = row.p.db_status.as_deref().unwrap_or("n/a");
+                        let col = if db == "Connected" { pal.good } else { pal.warn };
+                        ui.label(RichText::new(db).size(13.0).monospace().color(col));
+                    });
+                }
+            }
+            ui.end_row();
+
+            // TLS + CONTAINER UP (both)
+            metric(ui, pal, "TLS EXPIRES", |ui| {
+                let txt = if row.p.tls.is_empty() {
+                    "—".to_string()
+                } else {
+                    row.p.tls.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+                };
+                ui.label(RichText::new(txt).size(13.0).monospace().color(pal.ink));
+            });
+            metric(ui, pal, "CONTAINER UP", |ui| {
+                let restarts: i64 = row.p.restarts.parse().unwrap_or(0);
+                ui.label(RichText::new(fmt_since(&row.p.started)).size(13.0).monospace().color(pal.ink));
+                let col = if restarts > 0 { pal.warn } else { pal.mute };
+                ui.label(RichText::new(format!("· {restarts}⟳")).size(11.0).monospace().color(col));
+            });
+            ui.end_row();
+        });
 }
 
 fn host_panel(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
     let h = fleet.host.as_ref().unwrap();
-    // Traefik is the edge, not a property; if the gather returned any running
-    // containers the proxy is up (it fronts them all).
-    let traefik = if fleet.containers_running > 0 { "running" } else { "down" };
+    let traefik = if fleet.rows.iter().any(|r| r.p.status == "running") { "running" } else { "down" };
 
     card_frame(pal).show(ui, |ui| {
         ui.set_width(ui.available_width());
         let cell_w = (ui.available_width() - 28.0 - 3.0 * 28.0) / 4.0;
-
         let cell = |ui: &mut egui::Ui, k: &str, v: String, pct: Option<u8>, flag: bool| {
             ui.allocate_ui_with_layout(Vec2::new(cell_w, 58.0), Layout::top_down(Align::Min), |ui| {
                 ui.label(RichText::new(k).size(10.0).strong().color(pal.mute));
@@ -608,22 +737,18 @@ fn host_panel(ui: &mut egui::Ui, pal: &Palette, fleet: &Fleet) {
                 }
             });
         };
-
-        egui::Grid::new("host")
-            .num_columns(4)
-            .spacing([28.0, 14.0])
-            .show(ui, |ui| {
-                cell(ui, "DISK", reformat_disk(&h.disk), Some(h.disk_pct), false);
-                cell(ui, "MEMORY", reformat_mem(&h.mem), Some(h.mem_pct), false);
-                cell(ui, "LOAD (1m)", h.load.clone(), None, false);
-                cell(ui, "UPTIME", short_uptime(&h.uptime), None, false);
-                ui.end_row();
-                cell(ui, "OS UPGRADABLE", format!("{} pkgs", h.upgradable), None, false);
-                cell(ui, "SECURITY", format!("{} pending", h.security), None, h.security > 0);
-                cell(ui, "REBOOT REQUIRED", h.reboot.clone(), None, h.reboot == "YES");
-                cell(ui, "TRAEFIK", traefik.into(), None, traefik != "running");
-                ui.end_row();
-            });
+        egui::Grid::new("host").num_columns(4).spacing([28.0, 14.0]).show(ui, |ui| {
+            cell(ui, "DISK", reformat_disk(&h.disk), Some(h.disk_pct), false);
+            cell(ui, "MEMORY", reformat_mem(&h.mem), Some(h.mem_pct), false);
+            cell(ui, "LOAD (1m)", h.load.clone(), None, false);
+            cell(ui, "UPTIME", short_uptime(&h.uptime), None, false);
+            ui.end_row();
+            cell(ui, "OS UPGRADABLE", format!("{} pkgs", h.upgradable), None, false);
+            cell(ui, "SECURITY", format!("{} pending", h.security), None, h.security > 0);
+            cell(ui, "REBOOT REQUIRED", h.reboot.clone(), None, h.reboot == "YES");
+            cell(ui, "TRAEFIK", traefik.into(), None, traefik != "running");
+            ui.end_row();
+        });
     });
 }
 
@@ -645,7 +770,6 @@ fn gap_row(ui: &mut egui::Ui, pal: &Palette, g: &Gap) {
                 ui.label(RichText::new(&g.text).size(13.0).color(pal.ink));
             });
         });
-    // left severity stripe
     let r = resp.response.rect;
     ui.painter().rect_filled(
         Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
@@ -654,7 +778,7 @@ fn gap_row(ui: &mut egui::Ui, pal: &Palette, g: &Gap) {
     );
 }
 
-// ── small helpers ───────────────────────────────────────────────────────────
+// ── helpers ─────────────────────────────────────────────────────────────────
 
 fn section(ui: &mut egui::Ui, pal: &Palette, title: &str) {
     ui.horizontal(|ui| {
@@ -748,10 +872,9 @@ fn reformat_mem(s: &str) -> String {
     }
 }
 
-/// "7 weeks, 4 days, 9 hours, 28 minutes" → "7w 4d"
+/// "7 weeks, 4 days, ..." → "7w 4d"
 fn short_uptime(s: &str) -> String {
-    let mut weeks = None;
-    let mut days = None;
+    let (mut weeks, mut days) = (None, None);
     let toks: Vec<&str> = s.split(|c| c == ',' || c == ' ').filter(|t| !t.is_empty()).collect();
     for w in toks.windows(2) {
         if let Ok(n) = w[0].parse::<i64>() {
@@ -771,9 +894,7 @@ fn short_uptime(s: &str) -> String {
 }
 
 fn fmt_since(started: &str) -> String {
-    let Some((date, _)) = started.split_once('T') else {
-        return "—".into();
-    };
+    let Some((date, _)) = started.split_once('T') else { return "—".into() };
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
         return "—".into();
@@ -788,9 +909,7 @@ fn fmt_since(started: &str) -> String {
     match dates::days_until(&format!("{} {} 00:00:00 {} GMT", month_abbr(m), d, y)) {
         Some(days) => {
             let ago = -days;
-            if ago >= 7 {
-                format!("{}d", ago) // show days for parity with the board
-            } else if ago >= 1 {
+            if ago >= 1 {
                 format!("{ago}d")
             } else {
                 "today".into()
