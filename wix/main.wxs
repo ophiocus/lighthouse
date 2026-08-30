@@ -73,6 +73,29 @@
                         </Component>
                     </Directory>
 
+                    <!--
+                      The Start menu shortcut is what puts the app into Start > All apps,
+                      where it can be pinned and where people look for installed software.
+                      A Desktop shortcut and a PATH entry place nothing there.
+                      (Retrofitted from rust-skeleton; identity values cloned from this
+                      file's own DesktopShortcut, GUID minted fresh for this app.)
+                    -->
+                    <Component Id='StartMenuShortcut' Guid='CE264D8C-21E2-47C3-9A45-49DBDAC988EB'>
+                        <Shortcut Id='StartMenuShortcut'
+                            Name='Lighthouse'
+                            Description='Fleet health telemetry for the Tecnocratica VPS'
+                            Directory='ProgramMenuFolder'
+                            Target='[Bin]lighthouse.exe'
+                            WorkingDirectory='Bin'
+                            Icon='ProductICO' />
+                        <!-- ICE43: a non-advertised shortcut needs an HKCU keypath. -->
+                        <RegistryValue Root='HKCU'
+                            Key='Software\ophiocus\Lighthouse'
+                            Name='StartMenuShortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes' />
+                    </Component>
                     <Component Id='DesktopShortcut' Guid='4AC72183-5687-4D3D-97FD-7CD21A5C3FF6'>
                         <Shortcut Id='DesktopShortcut'
                             Name='Lighthouse'
@@ -90,6 +113,7 @@
                     </Component>
                 </Directory>
             </Directory>
+            <Directory Id='ProgramMenuFolder' Name='Programs' />
             <Directory Id='DesktopFolder' Name='Desktop' />
         </Directory>
 
@@ -103,6 +127,7 @@
             Display='expand'
             Absent='disallow'>
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='StartMenuShortcut'/>
             <ComponentRef Id='DesktopShortcut'/>
 
             <Feature
