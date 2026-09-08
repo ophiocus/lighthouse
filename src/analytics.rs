@@ -30,11 +30,14 @@ const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const ADMIN_BASE: &str = "https://analyticsadmin.googleapis.com/v1beta";
 const DATA_BASE: &str = "https://analyticsdata.googleapis.com/v1beta";
 
-/// Days of history requested. 28 aligns with the reporting window used
-/// elsewhere in the fleet docs.
-const WINDOW_DAYS: u32 = 28;
-/// How many trailing days of the series to keep for a sparkline.
-const SERIES_DAYS: usize = 7;
+/// The recent window — "is it being measured *now*".
+const RECENT_DAYS: u32 = 7;
+/// The long window — "has it *ever* been measured". Needed to tell a property
+/// that has gone blind apart from one that was only just provisioned. A 28-day
+/// window cannot make that distinction: the failure this feature exists to
+/// catch ran for six weeks, so at 28 days it looks identical to a brand-new
+/// property with no traffic yet.
+const YEAR_DAYS: u32 = 365;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -217,8 +220,6 @@ fn host_of(uri: &str) -> String {
 struct ReportResp {
     #[serde(default)]
     rows: Vec<ReportRow>,
-    #[serde(default)]
-    totals: Vec<ReportRow>,
 }
 #[derive(Deserialize)]
 struct ReportRow {
@@ -233,23 +234,26 @@ struct DimValue {
     value: String,
 }
 
-/// Pull the reporting window for one property.
+/// Pull both reporting windows for one property in a single request.
 ///
-/// Dates come back in the **property's** timezone, not the workstation's. They
-/// are kept as opaque `YYYYMMDD` strings and only ever compared to each other —
-/// never to a local date, which would produce off-by-one "silent property"
-/// alarms around midnight.
+/// Two named date ranges and **no** explicit dimension: the API adds an implicit
+/// `dateRange` dimension, so the response is exactly two rows, each already the
+/// total for its range. That sidesteps two traps at once — summing daily rows
+/// would double-count returning users, and building a per-day series would
+/// require knowing "today" in the *property's* timezone, which is not the
+/// workstation's and is the classic source of off-by-one "silent property"
+/// false alarms around midnight. No dates are parsed here at all.
 pub fn fetch(
     client: &reqwest::blocking::Client,
     token: &str,
     prop: &GaProperty,
 ) -> Result<Analytics, Error> {
     let body = serde_json::json!({
-        "dateRanges": [{ "startDate": format!("{}daysAgo", WINDOW_DAYS - 1), "endDate": "today" }],
-        "dimensions": [{ "name": "date" }],
+        "dateRanges": [
+            { "name": "recent", "startDate": format!("{}daysAgo", RECENT_DAYS - 1), "endDate": "today" },
+            { "name": "year",   "startDate": format!("{}daysAgo", YEAR_DAYS - 1),   "endDate": "today" },
+        ],
         "metrics": [{ "name": "activeUsers" }, { "name": "sessions" }],
-        "metricAggregations": ["TOTAL"],
-        "orderBys": [{ "dimension": { "dimensionName": "date" } }],
     });
 
     let url = format!("{DATA_BASE}/{}:runReport", prop.property_id);
@@ -272,48 +276,39 @@ pub fn fetch(
     let r: ReportResp =
         serde_json::from_str(&text).map_err(|e| Error::Parse(format!("runReport: {e}")))?;
 
-    // Daily rows, already ordered by date ascending.
-    let mut series: Vec<u64> = Vec::new();
-    let mut last_event_date: Option<String> = None;
-    let mut active_days = 0usize;
-
-    for row in &r.rows {
-        let date = row.dimension_values.first().map(|d| d.value.clone()).unwrap_or_default();
-        let users = num(row.metric_values.first());
-        series.push(users);
-        if users > 0 {
-            active_days += 1;
-            last_event_date = Some(date);
-        }
-    }
-
-    // `metricAggregations: TOTAL` gives a correctly de-duplicated user count for
-    // the whole range — summing the daily rows would double-count returning
-    // visitors and quietly inflate every card.
-    let (users_total, sessions_total) = match r.totals.first() {
-        Some(t) => (num(t.metric_values.first()), num(t.metric_values.get(1))),
-        None => (0, 0),
-    };
-
-    let series = series
-        .iter()
-        .rev()
-        .take(SERIES_DAYS)
-        .rev()
-        .copied()
-        .collect::<Vec<u64>>();
-
-    Ok(Analytics {
+    // Two rows, identified by the implicit dateRange dimension. A range with no
+    // data is omitted entirely rather than returned as zero, so default to zero
+    // and only overwrite on a row that is actually present.
+    let mut a = Analytics {
         property_id: prop.property_id.clone(),
         display_name: prop.display_name.clone(),
         measurement_id: prop.measurement_id.clone(),
-        users_window: users_total,
-        sessions_window: sessions_total,
-        window_days: WINDOW_DAYS,
-        active_days,
-        last_event_date,
-        series,
-    })
+        recent_days: RECENT_DAYS,
+        year_days: YEAR_DAYS,
+        users_recent: 0,
+        sessions_recent: 0,
+        users_year: 0,
+        sessions_year: 0,
+    };
+
+    for row in &r.rows {
+        let range = row.dimension_values.first().map(|d| d.value.as_str()).unwrap_or("");
+        let users = num(row.metric_values.first());
+        let sessions = num(row.metric_values.get(1));
+        match range {
+            "recent" => {
+                a.users_recent = users;
+                a.sessions_recent = sessions;
+            }
+            "year" => {
+                a.users_year = users;
+                a.sessions_year = sessions;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(a)
 }
 
 fn num(v: Option<&DimValue>) -> u64 {

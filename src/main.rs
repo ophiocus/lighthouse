@@ -52,15 +52,16 @@ fn describe_analytics(s: &model::AnalyticsState) -> String {
         A::AuthExpired => "AUTH EXPIRED — re-run infra/scripts/mint_adc.py".into(),
         A::Error(e) => format!("error: {e}"),
         A::Ok(a) => format!(
-            "{} ({})  {} users / {} sessions in {}d  active {}/{} days  last event {}",
+            "{} ({} {})  {}u/{}s last {}d · {}u/{}s last {}d",
             a.measurement_id,
             a.display_name,
-            a.users_window,
-            a.sessions_window,
-            a.window_days,
-            a.active_days,
-            a.window_days,
-            a.last_event_date.as_deref().unwrap_or("NEVER"),
+            a.property_id.trim_start_matches("properties/"),
+            a.users_recent,
+            a.sessions_recent,
+            a.recent_days,
+            a.users_year,
+            a.sessions_year,
+            a.year_days,
         ),
     }
 }
@@ -88,7 +89,15 @@ fn run_probe() {
                     r.p.db_status.as_deref().unwrap_or("-"),
                     if r.p.tls.is_empty() { "-" } else { &r.p.tls },
                 );
-                println!("                   analytics: {}", describe_analytics(&r.analytics));
+                let emitted = r.http.as_ref().and_then(|h| h.emitted_tag.as_deref());
+                let ads = r.http.as_ref().and_then(|h| h.emitted_adsense.as_deref());
+                println!(
+                    "                   emits={:14} verdict={:16} {}{}",
+                    emitted.unwrap_or("-"),
+                    model::derive_measurement(emitted, &r.analytics).label(),
+                    describe_analytics(&r.analytics),
+                    ads.map(|a| format!("  ads={a}")).unwrap_or_default(),
+                );
             }
             if let Some(h) = &f.host {
                 println!(

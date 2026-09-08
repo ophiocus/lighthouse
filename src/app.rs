@@ -1,7 +1,10 @@
 use crate::actions::{self, ActionResult};
 use crate::config::Config;
 use crate::git_update::{UpdateAvailable, UpdateState};
-use crate::model::{Fleet, Gap, Health, Project, ProjectType, Row, Sev};
+use crate::model::{
+    derive_measurement, AnalyticsState, Fleet, Gap, Health, Measurement, Project, ProjectType, Row,
+    Sev,
+};
 use crate::template::{actions_for, Action};
 use crate::{dates, telemetry};
 use eframe::egui;
@@ -560,7 +563,17 @@ fn property_grid(ui: &mut egui::Ui, pal: &Palette, rows: &[Row], max_lat: u128, 
     let cols = (((avail + gap) / (card_w + gap)).floor() as usize).clamp(1, rows.len().max(1));
 
     for chunk in rows.chunks(cols) {
-        let h = 288.0;
+        // The card frame is a hard-allocated fixed rect, so a card that gains a
+        // metric row without gaining height here clips it silently — no warning,
+        // no overflow, the row is simply not drawn. Derive the height instead of
+        // carrying a magic number: chrome (title, pills, latency bar, padding)
+        // plus METRIC_ROWS cells of ROW height separated by ROW_GAP. ROW must
+        // match the cell height in `metric()` and ROW_GAP the Grid `.spacing`.
+        const CHROME: f32 = 94.0;
+        const ROW: f32 = 58.0;
+        const ROW_GAP: f32 = 10.0;
+        const METRIC_ROWS: f32 = 4.0;
+        let h = CHROME + METRIC_ROWS * ROW + (METRIC_ROWS - 1.0) * ROW_GAP;
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
             for row in chunk {
@@ -713,6 +726,38 @@ fn metrics(ui: &mut egui::Ui, pal: &Palette, row: &Row, inner: f32, max_lat: u12
                 ui.label(RichText::new(fmt_since(&row.p.started)).size(13.0).monospace().color(pal.ink));
                 let col = if restarts > 0 { pal.warn } else { pal.mute };
                 ui.label(RichText::new(format!("· {restarts}⟳")).size(11.0).monospace().color(col));
+            });
+            ui.end_row();
+
+            // MEASUREMENT + TRAFFIC — the analytics lane. Every other cell on
+            // this card says the property *serves*; these say whether it is
+            // actually being *measured*, which fails independently and silently.
+            let emitted = row.http.as_ref().and_then(|h| h.emitted_tag.as_deref());
+            let verdict = derive_measurement(emitted, &row.analytics);
+            metric(ui, pal, "MEASUREMENT", |ui| {
+                let col = match verdict {
+                    Measurement::Measured => pal.good,
+                    Measurement::Blind | Measurement::Dark | Measurement::Unowned => pal.crit,
+                    Measurement::NeverRecorded => pal.warn,
+                    Measurement::NotProvisioned | Measurement::Unknown => pal.mute,
+                };
+                ui.label(RichText::new(verdict.label()).size(13.0).monospace().color(col));
+                if let Some(tag) = emitted {
+                    ui.label(RichText::new(format!("· {tag}")).size(11.0).monospace().color(pal.mute));
+                }
+            });
+            metric(ui, pal, "USERS · 7D", |ui| {
+                let (txt, col) = match &row.analytics {
+                    AnalyticsState::Ok(a) => (
+                        format!("{} · {} sessions", a.users_recent, a.sessions_recent),
+                        if a.users_recent > 0 { pal.ink } else { pal.warn },
+                    ),
+                    AnalyticsState::AuthExpired => ("auth expired".to_string(), pal.warn),
+                    AnalyticsState::Error(_) => ("unavailable".to_string(), pal.mute),
+                    AnalyticsState::NoProperty => ("—".to_string(), pal.mute),
+                    AnalyticsState::Disabled => ("not configured".to_string(), pal.mute),
+                };
+                ui.label(RichText::new(txt).size(13.0).monospace().color(col));
             });
             ui.end_row();
         });

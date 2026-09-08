@@ -6,7 +6,7 @@
 use crate::analytics;
 use crate::dates;
 use crate::model::*;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,13 @@ fn attach_analytics(rows: &mut [Row]) {
     }
 }
 
+fn recent_days(a: &AnalyticsState) -> u32 {
+    match a {
+        AnalyticsState::Ok(d) => d.recent_days,
+        _ => 0,
+    }
+}
+
 fn ssh_gather(host_alias: &str) -> Result<Gather, String> {
     let script = GATHER_SH.replace('\r', "");
     let mut child = Command::new("ssh")
@@ -159,16 +166,71 @@ fn ssh_gather(host_alias: &str) -> Result<Gather, String> {
     serde_json::from_str::<Gather>(&stdout).map_err(|e| format!("parse gather json: {e}"))
 }
 
+/// Read at most this much of a page when looking for analytics ids. Tags sit in
+/// the head; there is no reason to pull a whole asset-heavy document.
+const MAX_BODY_BYTES: u64 = 256 * 1024;
+
 fn http_probe(client: &reqwest::blocking::Client, base: &str, path: &str) -> Option<HttpProbe> {
     let url = format!("{}{}", base.trim_end_matches('/'), path);
     let start = Instant::now();
     match client.get(&url).send() {
         Ok(resp) => {
             let code = resp.status().as_u16();
-            Some(HttpProbe { code, latency_ms: start.elapsed().as_millis(), ok: code == 200 })
+            let latency_ms = start.elapsed().as_millis();
+
+            // Latency is measured on headers, before the body read, so scraping
+            // does not inflate the number the board reports.
+            let mut buf = Vec::new();
+            let _ = resp.take(MAX_BODY_BYTES).read_to_end(&mut buf);
+            let body = String::from_utf8_lossy(&buf);
+            let (emitted_tag, emitted_adsense) = scrape_ids(&body);
+
+            Some(HttpProbe { code, latency_ms, ok: code == 200, emitted_tag, emitted_adsense })
         }
         Err(_) => None,
     }
+}
+
+/// Pull the GA4 measurement id and AdSense publisher id out of served HTML.
+///
+/// Deliberately a hand-rolled scan rather than a regex dependency. Both ids have
+/// rigid shapes: `G-` then 6+ uppercase alphanumerics, `ca-pub-` then digits. The
+/// preceding character must be a non-identifier one, so `IMG-FOO` or a word
+/// ending in "g-" cannot masquerade as a measurement id.
+fn scrape_ids(body: &str) -> (Option<String>, Option<String>) {
+    let b = body.as_bytes();
+    let mut tag = None;
+    let mut adsense = None;
+
+    for (i, w) in b.windows(2).enumerate() {
+        if tag.is_none() && w == b"G-" {
+            let boundary = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-');
+            if boundary {
+                let rest: String = b[i + 2..]
+                    .iter()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                    .map(|c| *c as char)
+                    .collect();
+                if rest.len() >= 6 {
+                    tag = Some(format!("G-{rest}"));
+                }
+            }
+        }
+        if adsense.is_none() && i + 7 <= b.len() && &b[i..i + 7] == b"ca-pub-" {
+            let rest: String = b[i + 7..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .map(|c| *c as char)
+                .collect();
+            if rest.len() >= 10 {
+                adsense = Some(format!("ca-pub-{rest}"));
+            }
+        }
+        if tag.is_some() && adsense.is_some() {
+            break;
+        }
+    }
+    (tag, adsense)
 }
 
 fn derive_health(http: &Option<HttpProbe>, p: &Project) -> Health {
@@ -228,6 +290,45 @@ fn derive_gaps(g: &Gather, rows: &[Row]) -> Vec<Gap> {
         });
     }
 
+    // Measurement gaps. These are invisible to every other signal here: a BLIND
+    // or DARK property serves 200s, bootstraps cleanly and holds a valid cert.
+    for r in rows {
+        let emitted = r.http.as_ref().and_then(|h| h.emitted_tag.as_deref());
+        match derive_measurement(emitted, &r.analytics) {
+            Measurement::Blind => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "tag {} ships but nothing recorded in {} days — site is up and unmeasured",
+                    emitted.unwrap_or("?"),
+                    recent_days(&r.analytics),
+                ),
+            }),
+            Measurement::Dark => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: "no analytics tag on the page, but its property has history — the tag stopped shipping".into(),
+            }),
+            Measurement::Unowned => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "page ships {} — no property under this credential owns it",
+                    emitted.unwrap_or("?"),
+                ),
+            }),
+            Measurement::NeverRecorded => gaps.push(Gap {
+                sev: Sev::Warn,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "tag {} ships but has never recorded — new, or blind since birth",
+                    emitted.unwrap_or("?"),
+                ),
+            }),
+            _ => {}
+        }
+    }
+
     let no_hc = rows
         .iter()
         .filter(|r| r.ptype == ProjectType::Drupal && r.p.health == "none")
@@ -261,4 +362,58 @@ fn derive_gaps(g: &Gather, rows: &[Row]) -> Vec<Gap> {
     }
 
     gaps
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::scrape_ids;
+
+    #[test]
+    fn finds_gtag_and_adsense_in_real_shaped_markup() {
+        let html = r#"<!DOCTYPE html><html><head>
+          <script async src="https://www.googletagmanager.com/gtag/js?id=G-MCC3W5SYV5"></script>
+          <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3538083895087441" crossorigin="anonymous"></script>
+        </head><body>hi</body></html>"#;
+        let (tag, ads) = scrape_ids(html);
+        assert_eq!(tag.as_deref(), Some("G-MCC3W5SYV5"));
+        assert_eq!(ads.as_deref(), Some("ca-pub-3538083895087441"));
+    }
+
+    #[test]
+    fn absent_ids_are_none_not_empty_strings() {
+        let (tag, ads) = scrape_ids("<html><body>no analytics here</body></html>");
+        assert!(tag.is_none());
+        assert!(ads.is_none());
+    }
+
+    /// The boundary check is what stops ordinary markup from being read as a
+    /// measurement id. Without it an id-shaped tail inside another token would
+    /// make a dark property look measured — a false green, the worst outcome.
+    #[test]
+    fn does_not_match_an_id_shaped_tail_inside_another_token() {
+        let (tag, _) = scrape_ids(r#"<img class="XG-ABCDEF12" src="a.png">"#);
+        assert!(tag.is_none(), "matched inside a larger token");
+        let (tag, _) = scrape_ids(r#"<div data-x="SVG-ABCDEF12"></div>"#);
+        assert!(tag.is_none(), "matched after a letter");
+    }
+
+    /// Too short to be a measurement id — must not half-match.
+    #[test]
+    fn rejects_short_candidates() {
+        let (tag, _) = scrape_ids(r#"<p>G-AB1</p>"#);
+        assert!(tag.is_none());
+    }
+
+    /// A parking page that happens to serve 200 emits nothing; that is the
+    /// oidoenvivo.club case the apex fix addressed, and it must read as "no tag"
+    /// rather than as a scrape failure.
+    #[test]
+    fn parking_page_emits_nothing() {
+        let parked = r#"<!DOCTYPE html><html><head><script>window.onload=function(){window.location.href="/lander"}</script></head></html>"#;
+        let (tag, ads) = scrape_ids(parked);
+        assert!(tag.is_none());
+        assert!(ads.is_none());
+    }
 }

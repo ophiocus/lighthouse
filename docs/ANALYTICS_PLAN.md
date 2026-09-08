@@ -172,12 +172,27 @@ Option<String>`. `Row` gains `analytics: AnalyticsState`.
 Crossing *emission* against *data* yields four verdicts. This is the whole point
 of the feature; the numbers on the card are secondary.
 
-| Emits a tag | Has recent data | Verdict | Severity |
-| --- | --- | --- | --- |
-| yes | yes | measured | ok |
-| yes | **no** | **BLIND** — tag ships, nothing recorded | **crit** |
-| no | property has history | **DARK** — tag stopped shipping | **crit** |
-| no | no property | not provisioned | info |
+| Emits a tag | Recent data | Ever recorded | Verdict | Severity |
+| --- | --- | --- | --- | --- |
+| yes | yes | — | measured | ok |
+| yes | **no** | yes | **BLIND** — tag ships, nothing recorded | **crit** |
+| yes | no | no | never recorded — new, or blind since birth | warn |
+| no | — | yes | **DARK** — tag stopped shipping | **crit** |
+| no | — | no | not provisioned | info |
+| yes | *(no property this credential owns)* | | **UNOWNED TAG** | **crit** |
+
+**`UNOWNED TAG` was not in the original design and is the most valuable row.**
+A page shipping a measurement id that no property under the canonical credential
+owns means the site is reporting into somebody else's account. Under a
+single-owner analytics policy that is precisely the ownership question the fleet
+docs spent weeks resolving by hand, and the board can now answer it continuously.
+
+**The long window is what makes BLIND work.** With only a 28-day window a
+property blind for six weeks is indistinguishable from one provisioned
+yesterday: both show zero. The report asks for two named date ranges in one
+request — 7 days and 365 — so "silent now" and "has ever recorded" are separate
+facts. That also avoids parsing dates entirely, which sidesteps the
+property-timezone trap.
 
 BLIND is the zero-shot-games failure. DARK is a lost env var or a bad deploy.
 Neither is visible to any signal Lighthouse has today.
@@ -212,7 +227,7 @@ per-property daily token budget.
 | --- | --- | --- |
 | **P0** | `gather.sh` apex fix | **done** — `e8b6b3c` |
 | **P1** | New `src/analytics.rs`: token refresh, Admin-API property map, one `runReport`, per-row state. Surfaced in `--probe`. No UI. | **done** |
-| **P2** | Emission scraping in `http_probe`, the four verdicts, gap rows, a small badge on each card | next, ~80 lines |
+| **P2** | Emission scraping in `http_probe`, the verdicts, gap rows, card badge | **done** — 12 unit tests |
 | **P3** | Card detail: 7-day sparkline, top 3 pages, realtime users on click | ~120 lines egui |
 | **P4** | Token lifecycle: "expires in N days" and a Refresh button that runs the mint command and shows the URL to click | ~80 lines |
 
