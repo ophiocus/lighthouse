@@ -48,12 +48,15 @@ pub fn collect(host_alias: &str) -> Result<Fleet, String> {
             ptype,
             http,
             health,
-            analytics: AnalyticsState::Disabled,
+            analytics: AnalyticsState::Loading,
         });
     }
 
-    attach_analytics(&mut rows);
-
+    // NOTE: analytics is deliberately NOT collected here. It costs a dozen
+    // sequential round trips to Google, and folding it into this function meant
+    // the board showed a spinner for the sum of both — the health picture was
+    // ready and withheld. `attach_analytics` runs as its own pass so the board
+    // paints first and the analytics cells fill in behind it.
     let gaps = derive_gaps(&gather, &rows);
     Ok(Fleet {
         generated: gather.generated.clone(),
@@ -75,10 +78,24 @@ pub fn collect(host_alias: &str) -> Result<Fleet, String> {
 ///
 /// Properties are matched to projects by the data stream's own configured URL,
 /// so a newly-provisioned property is picked up with nothing to hand-maintain.
-fn attach_analytics(rows: &mut [Row]) {
-    let Some(path) = analytics::default_credential_path() else { return };
-    let Ok(adc) = analytics::load_adc(&path) else { return };
-    let Ok(client) = analytics::client() else { return };
+pub fn attach_analytics(rows: &mut [Row]) {
+    fn set_all(rows: &mut [Row], st: AnalyticsState) {
+        for r in rows.iter_mut() {
+            r.analytics = st.clone();
+        }
+    }
+
+    // Rows arrive as `Loading`. Every exit below must land them somewhere else,
+    // or a workstation with no credential shows "checking…" forever.
+    let Some(path) = analytics::default_credential_path() else {
+        return set_all(rows, AnalyticsState::Disabled);
+    };
+    let Ok(adc) = analytics::load_adc(&path) else {
+        return set_all(rows, AnalyticsState::Disabled);
+    };
+    let Ok(client) = analytics::client() else {
+        return set_all(rows, AnalyticsState::Disabled);
+    };
 
     let token = match analytics::access_token(&client, &adc) {
         Ok(t) => t,
@@ -135,6 +152,55 @@ fn recent_days(a: &AnalyticsState) -> u32 {
         AnalyticsState::Ok(d) => d.recent_days,
         _ => 0,
     }
+}
+
+/// Measurement gaps, derived once analytics has landed.
+///
+/// Kept separate from [`derive_gaps`] because analytics arrives in a later pass
+/// than the health picture: these are appended when the sweep completes, rather
+/// than holding the whole board back until it does.
+///
+/// Every gap here is invisible to every other signal on the board — a BLIND or
+/// DARK property serves 200s, bootstraps cleanly and holds a valid certificate.
+pub fn analytics_gaps(rows: &[Row]) -> Vec<Gap> {
+    let mut gaps = Vec::new();
+    for r in rows {
+        let emitted = r.http.as_ref().and_then(|h| h.emitted_tag.as_deref());
+        match derive_measurement(emitted, &r.analytics) {
+            Measurement::Blind => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "tag {} ships but nothing recorded in {} days — site is up and unmeasured",
+                    emitted.unwrap_or("?"),
+                    recent_days(&r.analytics),
+                ),
+            }),
+            Measurement::Dark => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: "no analytics tag on the page, but its property has history — the tag stopped shipping".into(),
+            }),
+            Measurement::Unowned => gaps.push(Gap {
+                sev: Sev::Crit,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "page ships {} — no property under this credential owns it",
+                    emitted.unwrap_or("?"),
+                ),
+            }),
+            Measurement::NeverRecorded => gaps.push(Gap {
+                sev: Sev::Warn,
+                label: r.p.slug.clone(),
+                text: format!(
+                    "tag {} ships but has never recorded — new, or blind since birth",
+                    emitted.unwrap_or("?"),
+                ),
+            }),
+            _ => {}
+        }
+    }
+    gaps
 }
 
 fn ssh_gather(host_alias: &str) -> Result<Gather, String> {
@@ -288,45 +354,6 @@ fn derive_gaps(g: &Gather, rows: &[Row]) -> Vec<Gap> {
             label: "host".into(),
             text: "reboot required (kernel/library update applied)".into(),
         });
-    }
-
-    // Measurement gaps. These are invisible to every other signal here: a BLIND
-    // or DARK property serves 200s, bootstraps cleanly and holds a valid cert.
-    for r in rows {
-        let emitted = r.http.as_ref().and_then(|h| h.emitted_tag.as_deref());
-        match derive_measurement(emitted, &r.analytics) {
-            Measurement::Blind => gaps.push(Gap {
-                sev: Sev::Crit,
-                label: r.p.slug.clone(),
-                text: format!(
-                    "tag {} ships but nothing recorded in {} days — site is up and unmeasured",
-                    emitted.unwrap_or("?"),
-                    recent_days(&r.analytics),
-                ),
-            }),
-            Measurement::Dark => gaps.push(Gap {
-                sev: Sev::Crit,
-                label: r.p.slug.clone(),
-                text: "no analytics tag on the page, but its property has history — the tag stopped shipping".into(),
-            }),
-            Measurement::Unowned => gaps.push(Gap {
-                sev: Sev::Crit,
-                label: r.p.slug.clone(),
-                text: format!(
-                    "page ships {} — no property under this credential owns it",
-                    emitted.unwrap_or("?"),
-                ),
-            }),
-            Measurement::NeverRecorded => gaps.push(Gap {
-                sev: Sev::Warn,
-                label: r.p.slug.clone(),
-                text: format!(
-                    "tag {} ships but has never recorded — new, or blind since birth",
-                    emitted.unwrap_or("?"),
-                ),
-            }),
-            _ => {}
-        }
     }
 
     let no_hc = rows

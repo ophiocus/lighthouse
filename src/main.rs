@@ -48,6 +48,7 @@ fn describe_analytics(s: &model::AnalyticsState) -> String {
     use model::AnalyticsState as A;
     match s {
         A::Disabled => "not configured on this workstation".into(),
+        A::Loading => "still being fetched".into(),
         A::NoProperty => "no GA4 property matches this site".into(),
         A::AuthExpired => "AUTH EXPIRED — re-run infra/scripts/mint_adc.py".into(),
         A::Error(e) => format!("error: {e}"),
@@ -69,7 +70,15 @@ fn describe_analytics(s: &model::AnalyticsState) -> String {
 fn run_probe() {
     let cfg = config::Config::load();
     println!("lighthouse probe → {}", cfg.host_alias);
-    match telemetry::collect(&cfg.host_alias) {
+    // The headless path wants the complete picture in one shot, so it does
+    // synchronously what the GUI splits into two passes.
+    let collected = telemetry::collect(&cfg.host_alias).map(|mut f| {
+        telemetry::attach_analytics(&mut f.rows);
+        let mut extra = telemetry::analytics_gaps(&f.rows);
+        f.gaps.append(&mut extra);
+        f
+    });
+    match collected {
         Ok(f) => {
             println!(
                 "{} projects ({} Drupal, {} Node)  healthy {}/{}  gaps {}  (snapshot {})",

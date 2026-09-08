@@ -94,6 +94,8 @@ pub struct LighthouseApp {
     loading: bool,
     last_refresh: Option<Instant>,
     fleet_rx: Option<mpsc::Receiver<Result<Fleet, String>>>,
+    /// Second-pass GA4 results, keyed by project slug.
+    analytics_rx: Option<mpsc::Receiver<Vec<(String, AnalyticsState)>>>,
 
     // control-action plumbing
     pending: Option<Pending>,
@@ -125,6 +127,7 @@ impl LighthouseApp {
             loading: false,
             last_refresh: None,
             fleet_rx: None,
+            analytics_rx: None,
             pending: None,
             action_rx: None,
             action_busy: false,
@@ -152,6 +155,24 @@ impl LighthouseApp {
         });
     }
 
+    /// Second pass: fetch GA4 state for an already-rendered fleet.
+    ///
+    /// Sends back `(slug, state)` pairs rather than a whole `Fleet` so a slow
+    /// sweep landing after the user has hit refresh cannot overwrite newer
+    /// health data — it only ever fills in the analytics cells.
+    fn start_analytics(&mut self, mut rows: Vec<Row>) {
+        let (tx, rx) = mpsc::channel();
+        self.analytics_rx = Some(rx);
+        std::thread::spawn(move || {
+            telemetry::attach_analytics(&mut rows);
+            let out: Vec<(String, AnalyticsState)> = rows
+                .into_iter()
+                .map(|r| (r.p.slug, r.analytics))
+                .collect();
+            let _ = tx.send(out);
+        });
+    }
+
     fn start_action(&mut self, pending: Pending) {
         self.action_busy = true;
         self.action_log = None;
@@ -171,8 +192,15 @@ impl LighthouseApp {
                 Ok(res) => {
                     match res {
                         Ok(f) => {
+                            // Paint health immediately, then chase analytics in
+                            // a second pass. Analytics costs ~a dozen sequential
+                            // round trips to Google; waiting for it before the
+                            // first paint meant a ready health picture sat
+                            // behind a spinner for the sum of both.
+                            let rows = f.rows.clone();
                             self.fleet = Some(f);
                             self.error = None;
+                            self.start_analytics(rows);
                         }
                         Err(e) => self.error = Some(e),
                     }
@@ -184,6 +212,26 @@ impl LighthouseApp {
                     self.loading = false;
                     self.fleet_rx = None;
                 }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.analytics_rx {
+            match rx.try_recv() {
+                Ok(states) => {
+                    if let Some(f) = &mut self.fleet {
+                        for (slug, st) in states {
+                            if let Some(row) = f.rows.iter_mut().find(|r| r.p.slug == slug) {
+                                row.analytics = st;
+                            }
+                        }
+                        // Measurement gaps could not exist until now, so append
+                        // them here rather than recomputing the health gaps.
+                        let mut extra = telemetry::analytics_gaps(&f.rows);
+                        f.gaps.append(&mut extra);
+                    }
+                    self.analytics_rx = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.analytics_rx = None,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -621,7 +669,34 @@ fn property_card(
             });
 
             ui.add_space(7.0);
-            ui.label(RichText::new(row.p.domains.join("   ·   ")).size(11.0).monospace().color(pal.type_color(row.ptype)));
+            // The card is a fixed-height frame, so this label's height is not
+            // free: a property carrying ten Host() labels wrapped to four lines
+            // and pushed its own action buttons out of the bottom of the card,
+            // silently. Drop the `www.` mirrors (implied by their apex), lead
+            // with the apex since that is the probe target, and cap the rest so
+            // the block can never exceed two lines.
+            const MAX_DOMAINS: usize = 3;
+            let mut shown: Vec<&str> = row
+                .p
+                .domains
+                .iter()
+                .map(|s| s.as_str())
+                .filter(|d| !d.starts_with("www."))
+                .collect();
+            if let Some(i) = shown.iter().position(|d| *d == row.p.apex) {
+                shown.swap(0, i);
+            }
+            let hidden = shown.len().saturating_sub(MAX_DOMAINS);
+            let mut txt = shown
+                .iter()
+                .take(MAX_DOMAINS)
+                .copied()
+                .collect::<Vec<_>>()
+                .join("   ·   ");
+            if hidden > 0 {
+                txt.push_str(&format!("   +{hidden}"));
+            }
+            ui.label(RichText::new(txt).size(11.0).monospace().color(pal.type_color(row.ptype)));
             ui.add_space(9.0);
             hline(ui, pal.line);
             ui.add_space(9.0);
@@ -752,6 +827,7 @@ fn metrics(ui: &mut egui::Ui, pal: &Palette, row: &Row, inner: f32, max_lat: u12
                         format!("{} · {} sessions", a.users_recent, a.sessions_recent),
                         if a.users_recent > 0 { pal.ink } else { pal.warn },
                     ),
+                    AnalyticsState::Loading => ("checking…".to_string(), pal.mute),
                     AnalyticsState::AuthExpired => ("auth expired".to_string(), pal.warn),
                     AnalyticsState::Error(_) => ("unavailable".to_string(), pal.mute),
                     AnalyticsState::NoProperty => ("—".to_string(), pal.mute),

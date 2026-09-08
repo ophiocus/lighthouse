@@ -122,6 +122,10 @@ pub struct Analytics {
 pub enum AnalyticsState {
     /// No credential on this workstation. Not a fault.
     Disabled,
+    /// The health board has painted; the analytics sweep is still in flight.
+    /// Analytics runs in its own pass precisely so this state is visible rather
+    /// than being hidden behind a longer spinner.
+    Loading,
     Ok(Analytics),
     /// No GA4 property matches this site.
     NoProperty,
