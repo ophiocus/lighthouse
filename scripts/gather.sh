@@ -30,6 +30,9 @@ for d in "$SITES"/*/; do
   [ -f "$f" ] || continue
   slug=$(sed -nE 's/^name:[[:space:]]*tec-([a-z0-9-]+).*/\1/p' "$f" | head -1)
   [ -n "$slug" ] || continue
+  # The site directory is named for the property's real apex. Used below to pick
+  # the probe target, and reported as the "apex" field.
+  apex=$(basename "$d")
 
   services=$(cd "$d" && docker compose config --services 2>/dev/null)
   if grep -qx drupal <<<"$services"; then
@@ -47,11 +50,20 @@ for d in "$SITES"/*/; do
   restarts=$(docker inspect -f '{{.RestartCount}}' "$container" 2>/dev/null || echo 0)
   image=$(docker inspect -f '{{.Config.Image}}' "$container" 2>/dev/null || echo "")
 
-  # Public hosts from Traefik labels; primary = first non-www, non-api.
+  # Public hosts from Traefik labels. The probe target is the property's own
+  # apex whenever Traefik serves it — picking the alphabetically first label
+  # instead sends the probe to a sibling domain, and for a property whose alias
+  # still points at registrar parking that answers 200 from a page which is not
+  # the site (false green, and no TLS date at all). Fall back to the first
+  # non-www/non-api label only when the apex is NOT served here: a property may
+  # legitimately be reached at a host other than its directory name.
   mapfile -t hosts < <(docker inspect "$container" --format '{{range .Config.Labels}}{{println .}}{{end}}' 2>/dev/null \
       | grep -oE 'Host\(`[^`]+`\)' | sed -E 's/.*`([^`]+)`.*/\1/' | sort -u)
   primary=""
-  for h in "${hosts[@]}"; do case "$h" in www.*|api.*) ;; *) primary="$h"; break;; esac; done
+  printf '%s\n' "${hosts[@]}" | grep -qxF "$apex" && primary="$apex"
+  if [ -z "$primary" ]; then
+    for h in "${hosts[@]}"; do case "$h" in www.*|api.*) ;; *) primary="$h"; break;; esac; done
+  fi
   [ -z "$primary" ] && primary="${hosts[0]:-}"
   url=""; [ -n "$primary" ] && url="https://$primary"
 
