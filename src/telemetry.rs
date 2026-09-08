@@ -3,6 +3,7 @@
 //!
 //! Blocking by design — call it on a background thread (see `app.rs`).
 
+use crate::analytics;
 use crate::dates;
 use crate::model::*;
 use std::io::Write;
@@ -42,8 +43,16 @@ pub fn collect(host_alias: &str) -> Result<Fleet, String> {
         if health == Health::Up {
             healthy += 1;
         }
-        rows.push(Row { p: p.clone(), ptype, http, health });
+        rows.push(Row {
+            p: p.clone(),
+            ptype,
+            http,
+            health,
+            analytics: AnalyticsState::Disabled,
+        });
     }
+
+    attach_analytics(&mut rows);
 
     let gaps = derive_gaps(&gather, &rows);
     Ok(Fleet {
@@ -56,6 +65,69 @@ pub fn collect(host_alias: &str) -> Result<Fleet, String> {
         gaps,
         rows,
     })
+}
+
+/// Fill in each row's GA4 state.
+///
+/// Deliberately infallible: analytics is a separate lane from health, so every
+/// failure collapses into a per-row [`AnalyticsState`] instead of failing the
+/// collection. A dead credential or a network blip must never blank the board.
+///
+/// Properties are matched to projects by the data stream's own configured URL,
+/// so a newly-provisioned property is picked up with nothing to hand-maintain.
+fn attach_analytics(rows: &mut [Row]) {
+    let Some(path) = analytics::default_credential_path() else { return };
+    let Ok(adc) = analytics::load_adc(&path) else { return };
+    let Ok(client) = analytics::client() else { return };
+
+    let token = match analytics::access_token(&client, &adc) {
+        Ok(t) => t,
+        Err(analytics::Error::AuthExpired) => {
+            for r in rows.iter_mut() {
+                r.analytics = AnalyticsState::AuthExpired;
+            }
+            return;
+        }
+        Err(e) => {
+            for r in rows.iter_mut() {
+                r.analytics = AnalyticsState::Error(e.to_string());
+            }
+            return;
+        }
+    };
+
+    let props = match analytics::discover(&client, &token) {
+        Ok(p) => p,
+        Err(e) => {
+            for r in rows.iter_mut() {
+                r.analytics = AnalyticsState::Error(e.to_string());
+            }
+            return;
+        }
+    };
+
+    for r in rows.iter_mut() {
+        let apex = r.p.apex.trim_start_matches("www.").to_ascii_lowercase();
+        let matched = props
+            .iter()
+            .find(|gp| {
+                !gp.host.is_empty()
+                    && (gp.host == apex
+                        || r.p.domains.iter().any(|d| {
+                            d.trim_start_matches("www.").eq_ignore_ascii_case(&gp.host)
+                        }))
+            })
+            .cloned();
+
+        r.analytics = match matched {
+            None => AnalyticsState::NoProperty,
+            Some(gp) => match analytics::fetch(&client, &token, &gp) {
+                Ok(a) => AnalyticsState::Ok(a),
+                Err(analytics::Error::AuthExpired) => AnalyticsState::AuthExpired,
+                Err(e) => AnalyticsState::Error(e.to_string()),
+            },
+        };
+    }
 }
 
 fn ssh_gather(host_alias: &str) -> Result<Gather, String> {

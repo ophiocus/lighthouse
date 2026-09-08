@@ -1,6 +1,13 @@
 # Feature plan — analytics in Lighthouse
 
-> Status: proposed, 2026-09-07. Nothing here is implemented yet.
+> Status: **P0 and P1 shipped and verified against the live fleet, 2026-09-08.**
+> P2–P4 proposed. See the phase table for what landed.
+>
+> Verification of P1 (`cargo run -- --probe`): all five Drupal properties matched
+> their GA4 property automatically through the data stream URL, with no
+> hand-maintained map; `myevery` correctly reported no property. Totals
+> cross-check exactly against the Data API queried independently — oidoenvivo
+> 14 users / 15 sessions, zero-shot-games 6 users / 11 sessions.
 
 ## The gap this closes
 
@@ -201,13 +208,18 @@ per-property daily token budget.
 
 ## Phases
 
-| Phase | Scope | Rough lift |
+| Phase | Scope | Status |
 | --- | --- | --- |
-| **P0** | `gather.sh` apex fix | ~10 lines |
-| **P1** | New `src/analytics.rs`: token refresh, Admin-API property map, one `runReport`. Wired into `--probe` JSON only. No UI. | ~150 lines + ~20 wiring |
-| **P2** | Emission scraping in `http_probe`, the four verdicts, gap rows, a small badge on each card | ~80 lines |
+| **P0** | `gather.sh` apex fix | **done** — `e8b6b3c` |
+| **P1** | New `src/analytics.rs`: token refresh, Admin-API property map, one `runReport`, per-row state. Surfaced in `--probe`. No UI. | **done** |
+| **P2** | Emission scraping in `http_probe`, the four verdicts, gap rows, a small badge on each card | next, ~80 lines |
 | **P3** | Card detail: 7-day sparkline, top 3 pages, realtime users on click | ~120 lines egui |
 | **P4** | Token lifecycle: "expires in N days" and a Refresh button that runs the mint command and shows the URL to click | ~80 lines |
+
+P1 already exposes most of the BLIND signal as `active N/28 days` — a property
+serving 200s with `active 0/28` is the six-week failure, visible now. P2 turns
+that reading into a gap row and a card badge so it does not depend on someone
+running the headless probe and noticing.
 
 P1 ships invisibly and is verifiable headlessly through `cargo run -- --probe`,
 which keeps the risky part away from the UI. P2 is where the feature earns its

@@ -89,6 +89,43 @@ pub struct HttpProbe {
     pub ok: bool,
 }
 
+// ── Analytics (GA4 Data API, also measured from the workstation) ────────────
+
+/// What a GA4 property actually recorded. Distinct from every other signal on
+/// this board: those say the property *serves*, this says it is *measured*.
+#[derive(Debug, Clone)]
+pub struct Analytics {
+    pub property_id: String,
+    pub display_name: String,
+    pub measurement_id: String,
+    /// De-duplicated users over the window (API TOTAL, not a sum of days).
+    pub users_window: u64,
+    pub sessions_window: u64,
+    pub window_days: u32,
+    /// Days in the window that recorded at least one user. Zero here on a
+    /// property that serves fine is the "measured but blind" failure.
+    pub active_days: usize,
+    /// Most recent day with events, `YYYYMMDD` in the *property's* timezone.
+    /// Compare only against other API dates, never against a local date.
+    pub last_event_date: Option<String>,
+    /// Trailing daily users, oldest first, for a sparkline.
+    pub series: Vec<u64>,
+}
+
+/// Analytics is an independent lane and never gates health, so every outcome —
+/// including "not configured" — is a state rather than an error.
+#[derive(Debug, Clone)]
+pub enum AnalyticsState {
+    /// No credential on this workstation. Not a fault.
+    Disabled,
+    Ok(Analytics),
+    /// No GA4 property matches this site.
+    NoProperty,
+    /// Refresh token dead. Expected roughly weekly; an operator action.
+    AuthExpired,
+    Error(String),
+}
+
 // ── Derived, render-ready fleet ─────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +167,7 @@ pub struct Row {
     pub ptype: ProjectType,
     pub http: Option<HttpProbe>,
     pub health: Health,
+    pub analytics: AnalyticsState,
 }
 
 #[derive(Debug, Clone)]

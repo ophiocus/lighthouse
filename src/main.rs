@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod actions;
+mod analytics;
 mod app;
 mod config;
 mod dates;
@@ -42,6 +43,28 @@ fn main() -> eframe::Result<()> {
     )
 }
 
+/// One-line rendering of a row's GA4 state for the headless probe.
+fn describe_analytics(s: &model::AnalyticsState) -> String {
+    use model::AnalyticsState as A;
+    match s {
+        A::Disabled => "not configured on this workstation".into(),
+        A::NoProperty => "no GA4 property matches this site".into(),
+        A::AuthExpired => "AUTH EXPIRED — re-run infra/scripts/mint_adc.py".into(),
+        A::Error(e) => format!("error: {e}"),
+        A::Ok(a) => format!(
+            "{} ({})  {} users / {} sessions in {}d  active {}/{} days  last event {}",
+            a.measurement_id,
+            a.display_name,
+            a.users_window,
+            a.sessions_window,
+            a.window_days,
+            a.active_days,
+            a.window_days,
+            a.last_event_date.as_deref().unwrap_or("NEVER"),
+        ),
+    }
+}
+
 fn run_probe() {
     let cfg = config::Config::load();
     println!("lighthouse probe → {}", cfg.host_alias);
@@ -65,6 +88,7 @@ fn run_probe() {
                     r.p.db_status.as_deref().unwrap_or("-"),
                     if r.p.tls.is_empty() { "-" } else { &r.p.tls },
                 );
+                println!("                   analytics: {}", describe_analytics(&r.analytics));
             }
             if let Some(h) = &f.host {
                 println!(
