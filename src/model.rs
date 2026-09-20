@@ -189,7 +189,16 @@ pub fn derive_measurement(emitted: Option<&str>, a: &AnalyticsState) -> Measurem
         // evidence, not evidence of absence.
         _ => return Measurement::Unknown,
     };
-    match (emitted.is_some(), data.users_recent > 0, data.users_year > 0) {
+    // Sessions, not just users, decide whether anything was recorded. GA4 can
+    // report activeUsers 0 alongside a non-zero session count, and on a
+    // low-traffic property that is common. Keying on users alone called a
+    // perfectly healthy property BLIND because two sessions landed with no
+    // user attributed — a false critical, which is worse than no check at all.
+    // A recorded session is proof the tag fired, which is the entire question.
+    let recent = data.users_recent > 0 || data.sessions_recent > 0;
+    let ever = data.users_year > 0 || data.sessions_year > 0;
+
+    match (emitted.is_some(), recent, ever) {
         (true, true, _) => Measurement::Measured,
         (true, false, true) => Measurement::Blind,
         (true, false, false) => Measurement::NeverRecorded,
@@ -261,6 +270,15 @@ mod tests {
     use super::*;
 
     fn data(users_recent: u64, users_year: u64) -> AnalyticsState {
+        data4(users_recent, users_recent, users_year, users_year)
+    }
+
+    fn data4(
+        users_recent: u64,
+        sessions_recent: u64,
+        users_year: u64,
+        sessions_year: u64,
+    ) -> AnalyticsState {
         AnalyticsState::Ok(Analytics {
             property_id: "properties/1".into(),
             display_name: "T".into(),
@@ -268,10 +286,31 @@ mod tests {
             recent_days: 7,
             year_days: 365,
             users_recent,
-            sessions_recent: users_recent,
+            sessions_recent,
             users_year,
-            sessions_year: users_year,
+            sessions_year,
         })
+    }
+
+    /// Regression, found against live data 2026-09-20: a real property reported
+    /// activeUsers 0 with 2 sessions in the window and was called BLIND. A
+    /// recorded session proves the tag fired, so this must read as measured.
+    /// A false critical is worse than no check at all.
+    #[test]
+    fn sessions_without_attributed_users_still_count_as_measured() {
+        assert_eq!(
+            derive_measurement(Some("G-TESTID1"), &data4(0, 2, 18, 23)),
+            Measurement::Measured
+        );
+    }
+
+    /// The converse still has to hold: genuinely nothing recorded is BLIND.
+    #[test]
+    fn zero_users_and_zero_sessions_is_still_blind() {
+        assert_eq!(
+            derive_measurement(Some("G-TESTID1"), &data4(0, 0, 18, 23)),
+            Measurement::Blind
+        );
     }
 
     #[test]
